@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Wai Chung
+# Qwen3.6-35B-A3B TR models on vLLM 0.28.0: the release configuration = TR2.25-G + tritq plugin (fused MoE, in-kernel split-K reduce,
+# expert-id-masked MoE path, sparse all-language draft head) + vLLM Model Runner V2 + the confidence-stop draft depth.
+# Build context: runtime/  ->  docker build -f docker/Dockerfile.qwen36-vllm028 -t tritq-qwen36:0.2 .
+# Base pinned by tag. A prebuilt image is published as ghcr.io/ternii-ai/tritq-qwen36:0.2.
+FROM vllm/vllm-openai:v0.28.0
+COPY vllm/tritq-qwen36 /opt/tritq-qwen36
+# 1. The plugin (vLLM general-plugin entry point "tritq").
+# 2. The confidence-stop overlay: 7 vLLM 0.28.0 files (6 modified + 1 new, confidence_stop.py), a port of vLLM PR #60068 by
+#    @stecasta (Apache-2.0) as carried by salient-data/qwen38-next-dgx-recipe patch 0010. Each file keeps the vLLM SPDX and
+#    copyright lines and carries a change notice. The originals' sha256 are checked first, so the overlay is only applied to the
+#    exact vLLM 0.28.0 files it was written against. The overlay sources stay in the image under /opt/tritq-qwen36/vllm028_overlay.
+RUN set -e; pip install --no-deps --no-build-isolation /opt/tritq-qwen36; \
+    SP=$(python3 -c "import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))"); \
+    cd "$SP" && sha256sum -c /opt/tritq-qwen36/vllm028_overlay/SHA256SUMS.vllm-0.28.0-originals; \
+    cd /opt/tritq-qwen36/vllm028_overlay && for f in $(find vllm -name '*.py' | sort); do \
+        install -D -m 0644 "$f" "$SP/$f"; python3 -m py_compile "$SP/$f"; echo "overlay: $f"; done; \
+    python3 -c "import importlib.metadata as m; print([e for e in m.entry_points(group='vllm.general_plugins') if e.name=='tritq'])"
+# Release engine settings. Model Runner V2 needs the plugin's masked MoE path (included). TQ_CSTOP turns the confidence stop on
+# (stop below top-1 probability 0.7 at one request, 3 drafts at two or more); serve with num_speculative_tokens 6. For multi-user
+# serving run with -e TQ_CSTOP= and num_speculative_tokens 3 (plain Model Runner V2 is faster per stream at 4-8 users).
+ENV VLLM_USE_V2_MODEL_RUNNER=1 \
+    TQ_CSTOP=0.7,3
+# Plugin defaults (tritq/__init__.py): fused MoE + in-kernel split-K reduce on; draft head = sparse (all languages).
+# -e TRITQ_DRAFT_HEAD=english selects the English-and-code head (first 100,000 vocabulary rows); full = full-vocabulary head.
+ENTRYPOINT ["vllm", "serve"]

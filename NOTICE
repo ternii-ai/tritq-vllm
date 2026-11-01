@@ -1,0 +1,41 @@
+tritq-vllm (TR Quantisation runtime for vLLM)
+Copyright 2026 Wai Chung
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This software is a plugin for vLLM (https://github.com/vllm-project/vllm, Apache-2.0, Copyright contributors to
+the vLLM project). Its GPU kernels are written in Triton (https://github.com/triton-lang/triton, MIT), which is a
+dependency and is not included.
+
+This product includes software from vLLM (https://github.com/vllm-project/vllm), Copyright contributors to the
+vLLM project, licensed under the Apache License, Version 2.0:
+  - tritq-qwen36/vllm028_overlay/vllm/ holds seven files of vLLM 0.28.0 (six modified, one new) that add a
+    confidence-stop draft depth to Model Runner V2 speculative decoding. They are a port of vLLM pull request
+    #60068 ("Confidence stop for autoregressive drafting", by @stecasta, Apache-2.0) as carried by
+    salient-data/qwen38-next-dgx-recipe (https://github.com/salient-data/qwen38-next-dgx-recipe), commit f309019,
+    recipe/patches/0010-vllm60068-confidence-stop-for-autoregressive-drafting.patch (ported there at PR head 029a811e).
+    Each modified file keeps the vLLM SPDX and copyright lines and carries a change notice.
+
+  qwen38-next-dgx-recipe
+  Copyright 2026 Salient Data
+  This repository is licensed under the Apache License, Version 2.0 (see LICENSE).
+  recipe/patches/ contains modifications of vLLM (https://github.com/vllm-project/vllm, Apache-2.0,
+  Copyright the vLLM project contributors). Each patch states the vLLM base commit it applies to and the
+  upstream pull request it ports, with its author; recipe/patches/PROVENANCE.md lists them. The vLLM
+  copyright and SPDX lines in the modified files are unchanged.
+
+Reimplemented from a published algorithm (no lines copied):
+  - The sparse context-aware draft head (tritq/sparse.py, option TRITQ_DRAFT_HEAD=sparse) reimplements, for the
+    packed-trit language-model head, the algorithm of vLLM pull request #59740 ("Context Aware Sparse LM Head", by
+    @stecasta, Apache-2.0; also carried by salient-data/qwen38-next-dgx-recipe as patch 0013). Its row-gather kernel
+    follows the layout of the PR's gather GEMV kernel.
+
+Ideas credited (no code was copied from these sources; each feature is an independent implementation):
+  - Reduced-vocabulary draft head for speculative decoding (TRITQ_DRAFT_HEAD=english): the idea is published in
+    FR-Spec (arXiv 2502.14856), VocabTrim (arXiv 2506.22694), community serving recipes for these models, and the
+    --mtp-vocab option of the Atlas inference engine (idea only; no Atlas code was copied or adapted; independent
+    implementation in Triton).
+
+See PROVENANCE.md for the file-by-file origin and THIRD_PARTY_NOTICES.md for the third-party terms.
+
+Qwen, NVIDIA, DGX Spark, CUDA, Mac and Metal: see TRADEMARKS.md.

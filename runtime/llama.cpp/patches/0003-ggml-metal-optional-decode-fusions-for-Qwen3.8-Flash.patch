@@ -1,0 +1,717 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Wai Chung <hello@ternii.com>
+Date: Sat, 24 Oct 2026 12:00:00 +0100
+Subject: [PATCH 3/4] ggml-metal: optional decode fusions for
+ Qwen3.8-Flash-Next (default off)
+
+GGML_METAL_OPT_GDNPREP: gated-delta-net input preparation folded into the
+GDN kernel for single-token decode. GGML_METAL_OPT_NGATED: RMS_NORM * w *
+gate(z) in one dispatch. Planned in graph_optimize; no-op unless the env
+flags are set.
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp     |  32 ++
+ ggml/src/ggml-metal/ggml-metal-device.h       |   1 +
+ ggml/src/ggml-metal/ggml-metal-impl.h         |  14 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp        | 277 +++++++++++++++++-
+ ggml/src/ggml-metal/ggml-metal-ops.h          |   8 +
+ ggml/src/ggml-metal/ggml-metal.cpp            |   3 +
+ .../ggml-metal/kernels/gated_delta_net.metal  | 147 ++++++++++
+ ggml/src/ggml-metal/kernels/norm.metal        |  73 +++++
+ 8 files changed, 552 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index a584952..83121a9 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -739,6 +739,38 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
+     return res;
+ }
+ 
++// TQ step-2: GDN with the input prep folded in (one token, K = 1, G = 1, S_v = 128)
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_prep(ggml_metal_library_t lib, const ggml_tensor * op) {
++    char base[256];
++    char name[256];
++
++    const int ne20 = op->src[2]->ne[0];
++    const int ne30 = op->src[3]->ne[0];
++    const int K    = ggml_get_op_params_i32(op, 0);
++
++    GGML_ASSERT(ne20 == 128 && ne30 == 1 && K == 1);
++
++    snprintf(base, 256, "kernel_gated_delta_net_prep_f32_4");
++    snprintf(name, 256, "%s_ne20=%d_ne30=%d_K=%d", base, ne20, ne30, K);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        ggml_metal_cv_t cv = ggml_metal_cv_init();
++
++        ggml_metal_cv_set_int16(cv, ne20, FC_GATED_DELTA_NET + 0);
++        ggml_metal_cv_set_int16(cv, ne30, FC_GATED_DELTA_NET + 1);
++        ggml_metal_cv_set_int16(cv, K,    FC_GATED_DELTA_NET + 2);
++
++        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
++
++        ggml_metal_cv_free(cv);
++    }
++
++    res.nsg = 4;
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_metal_library_t lib, const ggml_tensor * op) {
+     char base[256];
+     char name[256];
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 4012b9d..86039ca 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -133,6 +133,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_ssd_mma  (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net_prep(ggml_metal_library_t lib, const struct ggml_tensor * op); // TQ step-2
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_mma        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nt, int rt, bool add);
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index ba7b0b1..fe18b43 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -1017,6 +1017,20 @@ typedef struct {
+     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
+ } ggml_metal_kargs_gated_delta_net;
+ 
++// TQ step-2: GDN input prep folded into the GDN kernel (GGML_METAL_OPT_GDNPREP)
++typedef struct {
++    int32_t  ne00q;         // q/k head width (128): the stock RMS_NORM divides by this runtime value
++    int32_t  mask;          // diagnostic: bit 0 q, 1 k, 2 gate, 3 beta folded (15 = all); an unfolded part is read from device
++    float    eps_q;         // RMS_NORM eps of the q l2 norm (eps/n)
++    float    eps_k;
++    float    scale_q;       // SCALE of the q l2 norm (1/sqrt(n))
++    float    scale_k;
++    uint64_t q_nb1;         // raw q view: bytes per k-head
++    uint64_t q_nb3;         // raw q view: bytes per seq
++    uint64_t k_nb1;
++    uint64_t k_nb3;
++} ggml_metal_kargs_gdn_prep;
++
+ typedef struct {
+     int32_t  ne00;
+     int32_t  ne01;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 53c9816..c9e647f 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -12,6 +12,8 @@
+ 
+ #include <cassert>
+ #include <algorithm>
++#include <unordered_map>
++#include <vector>
+ #include <limits>
+ #include <cmath>
+ 
+@@ -19,6 +21,15 @@
+ // TODO: dedup
+ static constexpr int64_t GGML_METAL_MIN_THREADGROUPS = 128;
+ 
++// TQ step-2: follow RESHAPE / VIEW / PERMUTE / TRANSPOSE nodes to the tensor that produced the data
++static int s2_prep_mask();
++static const ggml_tensor * s2_strip_views(const ggml_tensor * t) {
++    while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE)) {
++        t = t->src[0];
++    }
++    return t;
++}
++
+ static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
+     if (!t) {
+         return { nullptr, 0 };
+@@ -87,7 +98,17 @@ struct ggml_metal_op {
+         assert(use_fusion());
+         assert(i0 >= 0 && i0 < n_nodes());
+ 
+-        return ggml_metal_fusion_next(gf, idxs.data(), (int) idxs.size(), i0, mode, n_out);
++        const ggml_metal_fusion * f = ggml_metal_fusion_next(gf, idxs.data(), (int) idxs.size(), i0, mode, n_out);
++        // TQ step-2: a stock fusion group must not swallow a node absorbed by a step-2 fusion
++        if (f && *n_out > 1) {
++            for (int j = 1; j < *n_out; ++j) {
++                if (ggml_graph_node(gf, idxs[i0 + j])->flags & (GGML_METAL_S2_ELIDE | GGML_METAL_S2_NGATED)) {
++                    *n_out = 1;
++                    return nullptr;
++                }
++            }
++        }
++        return f;
+     }
+ 
+     // whether to attempt fusion; the toggle lives in the shared fusion debugging context owned
+@@ -219,6 +240,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+         return 1;
+     }
+ 
++    // TQ step-2: node absorbed by a step-2 fusion (GDNPREP / NGATED) - its work runs at the chain's last node
++    if (node->flags & GGML_METAL_S2_ELIDE) {
++        if (ctx->debug_graph > 0) {
++            GGML_LOG_DEBUG("%s: node[%5d] - %-12s %s\n", __func__, idx, ggml_op_name(node->op), "(s2-elided)");
++        }
++        return 1;
++    }
++
+     int n_fuse = 1;
+ 
+     // check if the current node can run concurrently with other nodes before it
+@@ -232,7 +261,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+     {
+         bool is_concurrent = ggml_metal_op_concurrency_check(ctx, node);
+ 
+-        if (is_concurrent && ctx->use_fusion()) {
++        if (is_concurrent && ctx->use_fusion() && !(node->flags & GGML_METAL_S2_NGATED)) {
+             int n_fuse = 1;
+             const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n_fuse);
+             if (fusion) {
+@@ -283,6 +312,9 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+         }
+     }
+ 
++    if (node->flags & GGML_METAL_S2_NGATED) {
++        n_fuse = ggml_metal_op_s2_norm_gated(ctx, idx);   // TQ step-2
++    } else
+     switch (node->op) {
+         case GGML_OP_CONCAT:
+             {
+@@ -1941,7 +1973,10 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+ 
+-    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
++    const bool s2_prep = (op->flags & GGML_METAL_S2_GDNPREP) != 0;   // TQ step-2
++
++    auto pipeline = s2_prep ? ggml_metal_library_get_pipeline_gated_delta_net_prep(lib, op)
++                            : ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
+ 
+     // when fused with the trailing cache cpy, the snapshots are written straight into the
+     // recurrent cache and the cpy is skipped (see GGML_METAL_FUSION_GDN_CACHE)
+@@ -2020,6 +2055,35 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst (attn)
+     ggml_metal_encoder_set_buffer  (enc, bid_out,                              ida++); // state_out
+ 
++    if (s2_prep) {
++        // q/k/g/b above are the (elided, unwritten) prep outputs: the kernel reads the raw inputs below instead
++        const ggml_tensor * Sq = op->src[0];
++        const ggml_tensor * Sk = op->src[1];
++        const ggml_tensor * Lq = Sq->src[0];
++        const ggml_tensor * Lk = Sk->src[0];
++        ggml_metal_kargs_gdn_prep pargs;
++        pargs.ne00q = (int32_t) Lq->ne[0];
++        pargs.mask  = s2_prep_mask();
++        memcpy(&pargs.eps_q, Lq->op_params, sizeof(float));
++        memcpy(&pargs.eps_k, Lk->op_params, sizeof(float));
++        pargs.scale_q = ggml_get_op_params_f32(Sq, 0);
++        pargs.scale_k = ggml_get_op_params_f32(Sk, 0);
++        pargs.q_nb1 = op->src[6]->nb[1];
++        pargs.q_nb3 = op->src[6]->nb[3];
++        pargs.k_nb1 = op->src[7]->nb[1];
++        pargs.k_nb3 = op->src[7]->nb[3];
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[6]), ida++); // q raw (RMS_NORM input)
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[7]), ida++); // k raw
++        const ggml_tensor * Mg = s2_strip_views(op->src[3]);   // MUL(softplus(ADD(alpha, dt)), A)
++        const ggml_tensor * Ad = s2_strip_views(Mg->src[0]->src[0]);
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[8]), ida++); // alpha
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(Ad->src[1]), ida++);  // dt (weight)
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(Mg->src[1]), ida++);  // A (weight)
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[9]), ida++); // beta raw
++        ggml_metal_encoder_set_bytes (enc, &pargs, sizeof(pargs), ida++);
++        GGML_ASSERT(pipeline.nsg == 4 && "gdnprep: S_v = 128 only");
++    }
++
+     const int nsg = pipeline.nsg;
+ 
+     ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
+@@ -6034,3 +6098,210 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) {
+ 
+     return 1;
+ }
++
++
++// =====================================================================================================
++// TQ step-2: step-2 decode fusions, ported to the upstream
++// ff5a233 Metal backend. Planned once per graph in graph_optimize (before reorder and allocation): absorbed nodes
++// get GGML_METAL_S2_ELIDE (they emit nothing), the chain's LAST node does all the work and gets the activation inputs
++// as extra sources - this keeps them alive in the allocator and makes the concurrency / barrier logic see them.
++// A consumer check refuses a fusion if an absorbed intermediate has any other reader. Decode only (one token, one
++// sequence); prefill graphs are untouched. Both off by default.
++//   GGML_METAL_OPT_GDNPREP=1: SCALE(RMS_NORM(q)), SCALE(RMS_NORM(k)), MUL(softplus(ADD(alpha, dt)), A), sigmoid(beta)
++//                             -> computed inside the GATED_DELTA_NET kernel (src 6..9 = q raw, k raw, alpha, beta raw)
++//   GGML_METAL_OPT_NGATED=1:  MUL(MUL(RMS_NORM(x), w), sigmoid|silu(z)) -> one row kernel at the final MUL (src 2..4 = x, w, z)
++// =====================================================================================================
++
++static bool s2_env(const char * name) { const char * e = getenv(name); return e && atoi(e) != 0; }
++static bool s2_opt_gdnprep() { static int v = -1; if (v < 0) v = s2_env("GGML_METAL_OPT_GDNPREP"); return v; }
++static bool s2_opt_ngated()  { static int v = -1; if (v < 0) v = s2_env("GGML_METAL_OPT_NGATED");  return v; }
++static int  s2_prep_mask()   { static int v = -1; if (v < 0) { const char * e = getenv("GGML_METAL_S2_PREP_MASK"); v = e ? atoi(e) : 15; } return v; }   // diagnostic: bit 0 q, 1 k, 2 gate, 3 beta (default 15 = all)
++static bool s2_debug()       { static int v = -1; if (v < 0) v = s2_env("GGML_METAL_S2_DEBUG");    return v; }
++
++static const ggml_tensor * s2_base(const ggml_tensor * t) {
++    return t->view_src ? t->view_src : t;
++}
++
++// consumer map of the graph being planned: tensor -> nodes that read it directly or through a view of it (built once per plan)
++static std::unordered_map<const ggml_tensor *, std::vector<const ggml_tensor *>> s2_consumers;
++
++static void s2_build_consumers(const ggml_cgraph * gf) {
++    s2_consumers.clear();
++    for (int j = 0; j < gf->n_nodes; ++j) {
++        const ggml_tensor * nj = gf->nodes[j];
++        for (int k = 0; k < GGML_MAX_SRC; ++k) {
++            const ggml_tensor * sj = nj->src[k];
++            if (!sj) continue;
++            s2_consumers[sj].push_back(nj);
++            if (sj->view_src && sj->view_src != sj) s2_consumers[sj->view_src].push_back(nj);
++        }
++    }
++}
++
++// every node that reads t (directly or through a view of t) must be in `allowed`, or be a view / reshape of t whose own
++// readers are all allowed
++static bool s2_only_consumer(const ggml_cgraph * gf, const ggml_tensor * t, const ggml_tensor * const * allowed, int n_allowed) {
++    auto it = s2_consumers.find(t);
++    if (it == s2_consumers.end()) return true;
++    for (const ggml_tensor * nj : it->second) {
++        if (nj == t) continue;
++        bool ok = false;
++        for (int a = 0; a < n_allowed; ++a) if (nj == allowed[a]) { ok = true; break; }
++        if (ok) continue;
++        if (nj->view_src == t || nj->op == GGML_OP_RESHAPE || nj->op == GGML_OP_VIEW) {
++            if (!s2_only_consumer(gf, nj, allowed, n_allowed)) return false;
++            continue;
++        }
++        return false;
++    }
++    return true;
++}
++
++static bool s2_is_unary(const ggml_tensor * t, ggml_unary_op u) {
++    return t && t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == u;
++}
++
++static bool s2_vec(const ggml_tensor * t, int64_t n) {
++    return t && t->type == GGML_TYPE_F32 && ggml_nelements(t) == n && ggml_is_contiguous(t);
++}
++
++static int s2_plan_gdnprep(ggml_cgraph * gf) {
++    int n_ok = 0;
++    for (int i = 0; i < gf->n_nodes; ++i) {
++        ggml_tensor * g = gf->nodes[i];
++        if (g->op != GGML_OP_GATED_DELTA_NET || (g->flags & GGML_METAL_S2_GDNPREP)) continue;
++        const ggml_tensor * v = g->src[2];
++        const int64_t H = v->ne[1];
++        ggml_tensor * Sq = g->src[0];
++        ggml_tensor * Sk = g->src[1];
++        if (!Sq || Sq->op != GGML_OP_SCALE || !Sk || Sk->op != GGML_OP_SCALE) continue;
++        if (ggml_get_op_params_f32(Sq, 1) != 0.0f || ggml_get_op_params_f32(Sk, 1) != 0.0f) continue;   // no bias
++        ggml_tensor * Lq = Sq->src[0];
++        ggml_tensor * Lk = Sk->src[0];
++        if (!Lq || Lq->op != GGML_OP_RMS_NORM || !Lk || Lk->op != GGML_OP_RMS_NORM) continue;
++        ggml_tensor * Mg = (ggml_tensor *) s2_strip_views(g->src[3]);
++        ggml_tensor * Ub = g->src[4];
++        if (!Mg || Mg->op != GGML_OP_MUL || !s2_is_unary(Ub, GGML_UNARY_OP_SIGMOID)) continue;
++        ggml_tensor * Us = Mg->src[0];
++        if (!s2_is_unary(Us, GGML_UNARY_OP_SOFTPLUS)) continue;
++        ggml_tensor * Ad = (ggml_tensor *) s2_strip_views(Us->src[0]);
++        if (!Ad || Ad->op != GGML_OP_ADD) continue;
++        ggml_tensor * qr = Lq->src[0], * kr = Lk->src[0], * al = Ad->src[0], * br = Ub->src[0];
++        const ggml_tensor * A = Mg->src[1], * dt = Ad->src[1];
++        // the raw inputs become extra sources of EVERY matching GDN node - also in prefill / multi-sequence graphs, which are
++        // never fused: the scheduler may reuse one graph's allocation plan for another graph with the same node count (the
++        // prefill and decode graphs both have 6099 nodes), so all of them must carry the same lifetimes. Without this the
++        // decode graph ran on a prefill plan in which e.g. alpha is dead after its ADD: wrong gate after any batched prefill.
++        if (g->src[6] || g->src[7] || g->src[8] || g->src[9]) {
++            if (!(g->src[6] == qr && g->src[7] == kr && g->src[8] == al && g->src[9] == br)) continue;   // slots used by someone else
++        }
++        g->src[6] = qr; g->src[7] = kr; g->src[8] = al; g->src[9] = br;
++        // fuse only: one token, one sequence, S_v = 128, scalar gate per head, K = 1
++        if (v->ne[0] != 128 || v->ne[2] != 1 || v->ne[3] != 1 || g->src[3]->ne[0] != 1 || ggml_get_op_params_i32(g, 0) != 1) continue;
++        bool ok = qr->type == GGML_TYPE_F32 && kr->type == GGML_TYPE_F32 && qr->ne[0] == 128 && kr->ne[0] == 128 &&
++                  qr->nb[0] == sizeof(float) && kr->nb[0] == sizeof(float) && qr->ne[1] == Sq->ne[1] && kr->ne[1] == Sk->ne[1] &&
++                  (qr->nb[1] % 16) == 0 && (kr->nb[1] % 16) == 0 &&
++                  Sq->type == GGML_TYPE_F32 && Sk->type == GGML_TYPE_F32 && ggml_is_contiguous(Sq) && ggml_is_contiguous(Sk) &&
++                  Lq->ne[2] == 1 && Lq->ne[3] == 1 && Lk->ne[2] == 1 && Lk->ne[3] == 1 &&
++                  (H % 4) == 0 && s2_vec(A, H) && s2_vec(dt, H) && s2_vec(al, H) && s2_vec(br, H) && Ad->src[0]->ne[0] % 4 == 0 && br->ne[0] == 1 &&
++                  ggml_nelements(Mg) == H && ggml_nelements(Ub) == H && ggml_nelements(Ad) == H && ggml_nelements(Us) == H &&
++                  Mg->type == GGML_TYPE_F32 && Ub->type == GGML_TYPE_F32;
++        if (!ok) continue;
++        const ggml_tensor * a_g[] = { g }; const ggml_tensor * a_q[] = { Sq }; const ggml_tensor * a_k[] = { Sk };
++        const ggml_tensor * a_s[] = { Mg }; const ggml_tensor * a_a[] = { Us };
++        if (!s2_only_consumer(gf, Sq, a_g, 1) || !s2_only_consumer(gf, Sk, a_g, 1) || !s2_only_consumer(gf, Lq, a_q, 1) ||
++            !s2_only_consumer(gf, Lk, a_k, 1) || !s2_only_consumer(gf, Mg, a_g, 1) || !s2_only_consumer(gf, Ub, a_g, 1) ||
++            !s2_only_consumer(gf, Us, a_s, 1) || !s2_only_consumer(gf, Ad, a_a, 1)) continue;
++        const int pm = s2_prep_mask();
++        if (pm & 1) { Sq->flags |= GGML_METAL_S2_ELIDE; Lq->flags |= GGML_METAL_S2_ELIDE; }
++        if (pm & 2) { Sk->flags |= GGML_METAL_S2_ELIDE; Lk->flags |= GGML_METAL_S2_ELIDE; }
++        if (pm & 4) { Mg->flags |= GGML_METAL_S2_ELIDE; Us->flags |= GGML_METAL_S2_ELIDE; Ad->flags |= GGML_METAL_S2_ELIDE; }
++        if (pm & 8) { Ub->flags |= GGML_METAL_S2_ELIDE; }
++        g->flags |= GGML_METAL_S2_GDNPREP;
++        n_ok++;
++    }
++    return n_ok;
++}
++
++static int s2_plan_ngated(ggml_cgraph * gf) {
++    int n_ok = 0;
++    for (int i = 0; i < gf->n_nodes; ++i) {
++        ggml_tensor * M2 = gf->nodes[i];
++        if (M2->op != GGML_OP_MUL || (M2->flags & (GGML_METAL_S2_NGATED | GGML_METAL_S2_ELIDE))) continue;
++        ggml_tensor * M1 = M2->src[0];
++        ggml_tensor * U  = M2->src[1];
++        if (!M1 || M1->op != GGML_OP_MUL || !(s2_is_unary(U, GGML_UNARY_OP_SIGMOID) || s2_is_unary(U, GGML_UNARY_OP_SILU))) continue;
++        ggml_tensor * N = M1->src[0];
++        if (!N || N->op != GGML_OP_RMS_NORM) continue;
++        ggml_tensor * x = N->src[0], * w = M1->src[1], * z = U->src[0];
++        // extra sources on EVERY matching node (also never-fused prefill graphs), for the same allocation-plan reason as GDNPREP
++        if (M2->src[2] || M2->src[3] || M2->src[4]) {
++            if (!(M2->src[2] == x && M2->src[3] == w && M2->src[4] == z)) continue;
++        }
++        M2->src[2] = x; M2->src[3] = w; M2->src[4] = z;
++        const int64_t ne0 = N->ne[0];
++        bool ok = ne0 == 128 && N->type == GGML_TYPE_F32 && M1->type == GGML_TYPE_F32 && M2->type == GGML_TYPE_F32 && U->type == GGML_TYPE_F32 &&
++                  x->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32 && z->type == GGML_TYPE_F32 &&
++                  x->nb[0] == sizeof(float) && (x->nb[1] % 16) == 0 && ggml_nelements(w) == ne0 && ggml_is_contiguous(w) &&
++                  ggml_are_same_shape(M2, N) && ggml_are_same_shape(M1, N) && ggml_are_same_shape(U, N) && ggml_is_contiguous(M2) &&
++                  ggml_is_contiguous(z) && ggml_nelements(z) == ggml_nelements(N) && N->ne[2] == 1 && N->ne[3] == 1 &&
++                  !(x->flags & GGML_METAL_S2_ELIDE) && !(z->flags & GGML_METAL_S2_ELIDE);
++        if (!ok) continue;
++        const ggml_tensor * a_n[] = { M1 }; const ggml_tensor * a_m[] = { M2 };
++        if (!s2_only_consumer(gf, N, a_n, 1) || !s2_only_consumer(gf, M1, a_m, 1) || !s2_only_consumer(gf, U, a_m, 1)) continue;
++        N->flags |= GGML_METAL_S2_ELIDE; M1->flags |= GGML_METAL_S2_ELIDE; U->flags |= GGML_METAL_S2_ELIDE;
++        M2->flags |= GGML_METAL_S2_NGATED;
++        n_ok++;
++    }
++    return n_ok;
++}
++
++void ggml_metal_s2_plan(ggml_cgraph * gf, void * user_data, void (*add_alloc_dep)(void *, struct ggml_tensor *, struct ggml_tensor *)) {
++    GGML_UNUSED(user_data); GGML_UNUSED(add_alloc_dep);   // lifetimes come from the extra sources (all graphs), see s2_plan_gdnprep
++    const bool gp = s2_opt_gdnprep(), ng = s2_opt_ngated();
++    if (!gp && !ng) return;
++    const int64_t t0 = ggml_time_us();
++    s2_build_consumers(gf);
++    const int a = gp ? s2_plan_gdnprep(gf) : 0;
++    if (a > 0) s2_build_consumers(gf);   // GDNPREP added sources
++    const int b = ng ? s2_plan_ngated(gf)  : 0;
++    const int n_dep = 0;
++    if (s2_debug()) {
++        static int n_print = 0;
++        if (n_print++ < 64) fprintf(stderr, "[tq-s2] plan (n_nodes %d): gdnprep %d, ngated %d (%d), %.3f ms\n", gf->n_nodes, a, b, n_dep, (ggml_time_us() - t0)/1000.0);
++    }
++}
++
++int ggml_metal_op_s2_norm_gated(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * M2 = ctx->node(idx);
++    const ggml_tensor * M1 = M2->src[0];
++    const ggml_tensor * U  = M2->src[1];
++    const ggml_tensor * N  = M1->src[0];
++    ggml_tensor * x = M2->src[2], * w = M2->src[3], * z = M2->src[4];
++    GGML_ASSERT(N && N->op == GGML_OP_RMS_NORM && x && w && z);
++    float eps; memcpy(&eps, N->op_params, sizeof(float));
++    const bool sig = ggml_get_unary_op(U) == GGML_UNARY_OP_SIGMOID;
++    ggml_metal_kargs_norm args = {};
++    args.ne00 = (int32_t) N->ne[0]; args.ne00_t = args.ne00/4;
++    args.nb1 = M2->nb[1]; args.nb2 = M2->nb[2]; args.nb3 = M2->nb[3]; args.eps = eps;
++    args.nbf1[0] = x->nb[1]; args.nbf2[0] = x->nb[2]; args.nbf3[0] = x->nb[3];
++    args.nbf1[1] = z->nb[1]; args.nbf2[1] = z->nb[2]; args.nbf3[1] = z->nb[3];   // z row strides (reused field)
++    const char * kname = sig ? "kernel_rms_norm_gated_sigmoid_f32_4" : "kernel_rms_norm_gated_silu_f32_4";
++    auto pl = ggml_metal_library_get_pipeline(ctx->lib, kname);
++    if (!pl.pipeline) pl = ggml_metal_library_compile_pipeline(ctx->lib, kname, kname, nullptr);
++    // stock rms_norm thread count: 32, grown while < ne00_t, capped at round_up(ne00_t, 32) -> 32 for ne00 = 128
++    int nth = 32;
++    while (nth < args.ne00_t && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pl)) nth *= 2;
++    nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pl));
++    nth = std::min(nth, (args.ne00_t + 31)/32*32);
++    GGML_ASSERT(nth == 32 && args.ne00_t == 32 && "ngated: one simdgroup per row (ne00 = 128)");
++    ggml_metal_encoder_set_pipeline(ctx->enc, pl);
++    ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(x),  1);
++    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(w),  2);
++    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(z),  3);
++    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(M2), 4);
++    ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, (32 + 2*32*4)*sizeof(float), 0);
++    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, N->ne[1], N->ne[2], N->ne[3], nth, 1, 1);
++    return 1;
++}
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index 583d115..6696dc0 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -8,6 +8,14 @@ extern "C" {
+ 
+ typedef struct ggml_metal_op * ggml_metal_op_t;
+ 
++// TQ step-2: step-2 decode fusions, planned in graph_optimize, default off
++#define GGML_METAL_S2_ELIDE   (1 << 24) // node absorbed by a step-2 fusion: emits nothing
++#define GGML_METAL_S2_GDNPREP (1 << 25) // GATED_DELTA_NET with its q/k l2 norms, gate and beta folded in (GGML_METAL_OPT_GDNPREP)
++#define GGML_METAL_S2_NGATED  (1 << 26) // final MUL of RMS_NORM(x)*w*gate(z), does all three (GGML_METAL_OPT_NGATED)
++
++void ggml_metal_s2_plan(struct ggml_cgraph * gf, void * user_data, void (*add_alloc_dep)(void *, struct ggml_tensor *, struct ggml_tensor *));
++int  ggml_metal_op_s2_norm_gated(ggml_metal_op_t ctx, int idx);
++
+ struct ggml_metal_fusion; // forward decl (ggml-metal-device.h)
+ 
+ ggml_metal_op_t ggml_metal_op_init(
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index 344882e..0926136 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -570,6 +570,9 @@ static void ggml_backend_metal_event_wait(ggml_backend_t backend, ggml_backend_e
+ static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+     GGML_ASSERT(params && params->add_alloc_dep);
+ 
++    // TQ step-2: step-2 decode fusions (GDNPREP / NGATED), no-op unless their env flags are set
++    ggml_metal_s2_plan(cgraph, params->user_data, params->add_alloc_dep);
++
+     // keep the MoE weighted-reduction inputs alive until the fused output so the
+     // allocator cannot reuse them while the fused kernel is still reading them
+     ggml_metal_fusion_add_alloc_deps(params->user_data, params->add_alloc_dep, cgraph);
+diff --git a/ggml/src/ggml-metal/kernels/gated_delta_net.metal b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
+index 5e4861e..ee3d2fb 100644
+--- a/ggml/src/ggml-metal/kernels/gated_delta_net.metal
++++ b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
+@@ -151,6 +151,153 @@ template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta
+ template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<2>;
+ template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<4>;
+ 
++// TQ step-2: kernel_gated_delta_net_impl<4> (one token, K = 1, G = 1) with the GDN input prep folded in
++// (GGML_METAL_OPT_GDNPREP). No threadgroup memory and no barrier: in the main loop lane tx of every simdgroup needs exactly
++// q[4tx..4tx+3] and k[4tx..4tx+3], i.e. its own float4 of the l2 norm, so each simdgroup computes the two norms itself as the
++// stock fused RMS_NORM + SCALE does (kernel_rms_norm_mul_f32_4 use_scale, 32 threads: lane t owns float4 t, 0 + dot, simd_sum,
++// the second-stage simd_sum only adds zeros; y = (x*scale)*s), and every lane computes the per-head gate
++// softplus(alpha + dt) * A (the stock SOFTPLUS runs its float4 kernel: evaluated here on the head's aligned group of 4).
++// and sigmoid(beta) (the stock SIGMOID runs its scalar kernel: the beta view has ne0 = 1).
++// mask (GGML_METAL_S2_PREP_MASK, default 15): bit 0 q, 1 k, 2 gate, 3 beta folded; an unfolded part is read from the stock tensor.
++kernel void kernel_gated_delta_net_prep_f32_4(
++        constant ggml_metal_kargs_gated_delta_net & args,
++        device const char * q,
++        device const char * k,
++        device const char * v,
++        device const char * g,
++        device const char * b,
++        device const char * s,
++        device       char * dst,
++        device       char * dst_fuse,
++        device const char  * q_raw,
++        device const char  * k_raw,
++        device const float * alpha,
++        device const float * dt,
++        device const float * A,
++        device const float * b_raw,
++        constant ggml_metal_kargs_gdn_prep & pargs,
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        uint3 tpitg[[thread_position_in_threadgroup]],
++        uint3   ntg[[threads_per_threadgroup]])  {
++#define S_v FC_gated_delta_net_ne20
++    constexpr short NSG = 4;
++
++    const uint tx = tpitg.x;
++    const uint ty = tpitg.y;
++
++    const uint i23 = tgpig.z; // B (n_seqs)
++    const uint i21 = tgpig.y; // H (head)
++    const uint i20 = tgpig.x*NSG + ty; // row within S_v
++
++    const uint i01 = i21 % args.ne01;
++    const uint i11 = i21 % args.ne11;
++
++    const float scale = 1.0f / sqrt((float)S_v);
++
++    // the state first, as the stock kernel
++    const uint state_in_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
++    device const float * s_ptr = (device const float *) (s) + state_in_base;
++
++    float ls[NSG];
++
++    FOR_UNROLL (short j = 0; j < NSG; j++) {
++        const short is = tx*NSG + j;
++        ls[j] = s_ptr[is];
++    }
++
++    // ---- prep (registers only) ----
++    float4 qv, kv;
++    if (pargs.mask & 1) {
++        const float4 xv = ((device const float4 *) (q_raw + i23*pargs.q_nb3 + i01*pargs.q_nb1))[tx];
++        float sumf = 0.0f;
++        sumf += dot(xv, xv);
++        sumf = simd_sum(sumf);
++        const float mean = sumf/pargs.ne00q;
++        const float scl  = 1.0f/sqrt(mean + pargs.eps_q);
++        qv = (xv*scl) * pargs.scale_q;
++    } else {
++        qv = ((device const float4 *) (q + i23*args.nb03 + i01*args.nb01))[tx];
++    }
++    if (pargs.mask & 2) {
++        const float4 xv = ((device const float4 *) (k_raw + i23*pargs.k_nb3 + i11*pargs.k_nb1))[tx];
++        float sumf = 0.0f;
++        sumf += dot(xv, xv);
++        sumf = simd_sum(sumf);
++        const float mean = sumf/pargs.ne00q;
++        const float scl  = 1.0f/sqrt(mean + pargs.eps_k);
++        kv = (xv*scl) * pargs.scale_k;
++    } else {
++        kv = ((device const float4 *) (k + i23*args.nb13 + i11*args.nb11))[tx];
++    }
++    float gv;
++    if (pargs.mask & 4) {
++        const uint i4 = i21 & ~3u;
++        const uint ih = i23*args.ne21 + i4;
++        const float4 x4 = float4(alpha[ih], alpha[ih + 1], alpha[ih + 2], alpha[ih + 3]) +
++                          float4(dt[i4],    dt[i4 + 1],    dt[i4 + 2],    dt[i4 + 3]);
++        const float4 sp4 = select(log(1 + exp(x4)), x4, x4 > 20);
++        gv = sp4[i21 - i4] * A[i21];
++    } else {
++        gv = ((device const float *) (g))[i23*args.ne22*args.ne21 + i21];
++    }
++    float bv;
++    if (pargs.mask & 8) {
++        const float x = b_raw[i23*args.ne21 + i21];
++        bv = (1 / (1 + exp(-x)));   // kernel_unary SIGMOID (scalar: the beta view has ne0 = 1)
++    } else {
++        bv = ((device const float *) (b))[i23*args.ne22*args.ne21 + i21];
++    }
++
++    device float * dst_attn = (device float *) (dst) + (i23*args.ne22*args.ne21 + i21)*S_v + i20;
++    device const float * v_ptr = (device const float *) (v + i23*args.nb23 + i21*args.nb21);
++
++    const uint state_out_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
++    const uint attn_size = args.ne22 * args.ne21 * S_v * args.ne23;
++
++    const bool fused = args.nb_out > 0;
++    const device float * state_out = fused ? (device float *)dst_fuse : (device float *)dst + attn_size;
++
++    {
++        float s_k = 0.0f;
++
++        const float g_exp = exp(gv);
++
++        FOR_UNROLL (short j = 0; j < NSG; j++) {
++            ls[j] *= g_exp;
++
++            s_k += ls[j]*kv[j];
++        }
++
++        s_k = simd_sum(s_k);
++
++        const float d = (v_ptr[i20] - s_k)*bv;
++
++        float y = 0.0f;
++
++        FOR_UNROLL (short j = 0; j < NSG; j++) {
++            ls[j] += kv[j]*d;
++
++            y += ls[j]*qv[j];
++        }
++
++        y = simd_sum(y);
++
++        if (tx == 0) {
++            dst_attn[0] = y*scale;
++        }
++    }
++
++    {
++        device float * dst_state = (device float *)state_out + state_out_base;
++        FOR_UNROLL (short j = 0; j < NSG; j++) {
++            const short is = tx*NSG + j;
++            dst_state[is] = ls[j];
++        }
++    }
++
++#undef S_v
++}
++
+ #else
+ // a simplified version of the above
+ // no performance improvement, so keep the above version for now
+diff --git a/ggml/src/ggml-metal/kernels/norm.metal b/ggml/src/ggml-metal/kernels/norm.metal
+index c76d0c7..5f4dfdd 100644
+--- a/ggml/src/ggml-metal/kernels/norm.metal
++++ b/ggml/src/ggml-metal/kernels/norm.metal
+@@ -183,6 +183,79 @@ template [[host_name("kernel_rms_norm_f32_4")]]         kernel kernel_rms_norm_f
+ template [[host_name("kernel_rms_norm_mul_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
+ template [[host_name("kernel_rms_norm_mul_add_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 3>;
+ 
++// TQ step-2: y = (RMS_NORM(x)*w) * gate(z) in ONE dispatch (GGML_METAL_OPT_NGATED), GT = 0: sigmoid (qwen4exp),
++// GT = 1: silu (qwen3.5). Reduction = kernel_rms_norm_fuse_impl<float4, 2> with the stock 32 threads (one float4 each, ne00 = 128);
++// gate = kernel_unary SIGMOID / SILU; product = kernel_bin MUL. Both factors go through threadgroup memory before the product,
++// as the stock kernels pass them through device memory.
++template <short GT>
++kernel void kernel_rms_norm_gated_impl(
++        constant ggml_metal_kargs_norm & args,
++        device const char * src_x,
++        device const char * src_w,
++        device const char * src_z,
++        device       char * dst,
++        threadgroup float * shmem_f32 [[threadgroup(0)]],
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort  sgitg[[simdgroup_index_in_threadgroup]],
++        ushort  tiisg[[thread_index_in_simdgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++    if (sgitg == 0) {
++        shmem_f32[tiisg] = 0.0f;
++    }
++
++    const int i01 = tgpig.x;
++    const int i02 = tgpig.y;
++    const int i03 = tgpig.z;
++
++    device const float4 * x  = (device const float4 *) (src_x + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
++    device const float4 * f0 = (device const float4 *) (src_w);
++    device const float4 * zz = (device const float4 *) (src_z + i03*args.nbf3[1] + i02*args.nbf2[1] + i01*args.nbf1[1]);
++
++    float sumf = 0.0f;
++
++    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
++        sumf += dot(x[i00], x[i00]);
++    }
++    sumf = simd_sum(sumf);
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    if (tiisg == 0) {
++        shmem_f32[sgitg] = sumf;
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    sumf = shmem_f32[tiisg];
++    sumf = simd_sum(sumf);
++
++    const float mean  = sumf/args.ne00;
++    const float scale = 1.0f/sqrt(mean + args.eps);
++
++    threadgroup float4 * ty = (threadgroup float4 *) (shmem_f32 + 32);
++    threadgroup float4 * ts = ty + 32;
++    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
++        ty[i00] = (x[i00]*scale)*f0[i00];
++        const float4 zv = zz[i00];
++        if (GT == 0) {
++            ts[i00] = (1 / (1 + exp(-zv)));
++        } else {
++            ts[i00] = (zv / (1 + exp(-zv)));
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    device float4 * y = (device float4 *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
++    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
++        y[i00] = ty[i00] * ts[i00];
++    }
++}
++
++typedef decltype(kernel_rms_norm_gated_impl<0>) kernel_rms_norm_gated_t;
++
++template [[host_name("kernel_rms_norm_gated_sigmoid_f32_4")]] kernel kernel_rms_norm_gated_t kernel_rms_norm_gated_impl<0>;
++template [[host_name("kernel_rms_norm_gated_silu_f32_4")]]    kernel kernel_rms_norm_gated_t kernel_rms_norm_gated_impl<1>;
++
+ template <typename T0, typename T>
+ kernel void kernel_l2_norm_impl(
+         constant ggml_metal_kargs_l2_norm & args,

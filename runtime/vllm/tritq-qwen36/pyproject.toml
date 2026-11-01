@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tritq-qwen36"
+version = "0.2.0"
+description = "TR Quantisation: vLLM plugin with the packed k-trit ('trit') quantization method, Triton kernels and a sparse draft head for Qwen3.6-35B-A3B TR models"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Wai Chung" }]
+requires-python = ">=3.10"
+# vLLM, torch and triton come from the serving image (vllm/vllm-openai:v0.28.0); they are not pulled in here on purpose.
+# Install with --no-deps inside that image. The extra below pins the tested vLLM for bare-metal installs.
+dependencies = ["numpy"]
+classifiers = ["License :: OSI Approved :: Apache Software License", "Programming Language :: Python :: 3"]
+
+[project.optional-dependencies]
+vllm = ["vllm==0.28.0"]
+
+# vLLM loads every installed "vllm.general_plugins" entry point in every process; register() adds quant_method "trit".
+# Do NOT install together with tritq-qwen38 in one environment: both register the name "trit".
+[project.entry-points."vllm.general_plugins"]
+tritq = "tritq.vllm_plugin:register"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["tritq"]

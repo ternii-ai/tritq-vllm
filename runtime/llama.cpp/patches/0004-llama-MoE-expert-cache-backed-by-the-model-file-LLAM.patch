@@ -1,0 +1,1197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Wai Chung <hello@ternii.com>
+Date: Sat, 24 Oct 2026 12:00:00 +0100
+Subject: [PATCH 4/4] llama: MoE expert cache backed by the model file
+ (LLAMA_MOE_SSD=1, default off)
+
+Keeps routed expert weights in the GGUF file and reads only the experts
+the router selects into a fixed bank of slots in GPU-visible memory, with
+LRU replacement per layout group. Output is unchanged versus the fully
+resident model (raw-logit gate). For machines whose memory cannot hold all
+experts. Budget: LLAMA_MOE_CACHE_MIB. Stats: LLAMA_MOE_STATS=path.
+---
+ ggml/src/ggml-backend.cpp                 |  10 +-
+ ggml/src/ggml-metal/ggml-metal-common.cpp |   3 +-
+ ggml/src/ggml-metal/ggml-metal-context.h  |  10 +
+ ggml/src/ggml-metal/ggml-metal-context.m  | 118 +++++
+ ggml/src/ggml-metal/ggml-metal-device.cpp |   2 +-
+ ggml/src/ggml-metal/ggml-metal-impl.h     |   1 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |  15 +-
+ ggml/src/ggml-metal/ggml-metal.cpp        |  30 ++
+ ggml/src/ggml-metal/kernels/mul_mm.metal  |  17 +-
+ src/llama-context.cpp                     |  11 +
+ src/llama-graph.cpp                       |   7 +
+ src/llama-model-loader.cpp                |  12 +-
+ src/llama-model-loader.h                  |   3 +-
+ src/llama-model.cpp                       |  20 +
+ src/llama-model.h                         |   8 +
+ src/llama-moe-cache.cpp                   | 532 +++++++++++++++++++++-
+ src/llama-moe-cache.h                     |   4 +
+ 17 files changed, 784 insertions(+), 19 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index ffbcba3..6e72f6a 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1837,6 +1837,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         return;
+     }
+ 
++    // (tq expert cache) GGML_SCHED_COPY_CB_FIRST=1: the copy callback gets host weights BEFORE the backend is synchronized and
++    // takes over the synchronization (the asynchronous MoE expert cache); if it declines, the default path below runs
++    static const bool cb_first = getenv("GGML_SCHED_COPY_CB_FIRST") != NULL && atoi(getenv("GGML_SCHED_COPY_CB_FIRST")) != 0;
++    if (cb_first && sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
++        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
++        return;
++    }
++
+     // wait for the split backend to finish using the input before overwriting it
+     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+@@ -1844,7 +1852,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+         ggml_backend_synchronize(split_backend);
+     }
+ 
+-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
++    if (!cb_first && sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+         return;
+     }
+diff --git a/ggml/src/ggml-metal/ggml-metal-common.cpp b/ggml/src/ggml-metal/ggml-metal-common.cpp
+index 70fd551..7c88bce 100644
+--- a/ggml/src/ggml-metal/ggml-metal-common.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-common.cpp
+@@ -43,7 +43,8 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
+ 
+ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
+     const int64_t ne00 = op->src[0]->ne[0];
+-    const int64_t ne02 = op->src[0]->ne[2];
++    // (tq expert cache) packed ids (op_params[6] = shift, [7] = number of experts): the prepass groups by expert, not by slot
++    const int64_t ne02 = ggml_get_op_params_i32(op, 6) > 0 ? ggml_get_op_params_i32(op, 7) : op->src[0]->ne[2];
+     const int64_t ne21 = op->src[2]->ne[1];
+ 
+     return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= 32;
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.h b/ggml/src/ggml-metal/ggml-metal-context.h
+index b538b1a..f9f6685 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.h
++++ b/ggml/src/ggml-metal/ggml-metal-context.h
+@@ -31,6 +31,16 @@ void ggml_metal_event_wait  (ggml_metal_t ctx, ggml_metal_event_t ev);
+ 
+ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx);
+ 
++// (tq expert cache) MoE expert cache, asynchronous mode: the GPU signals a "done" point and waits at a "go" point that the host
++// signals from another thread once the experts of the layer are in place (see llama-moe-cache.cpp)
++uint64_t ggml_metal_moe_signal_point(ggml_metal_t ctx);
++uint64_t ggml_metal_moe_wait_point  (ggml_metal_t ctx);
++void     ggml_metal_moe_host_wait   (uint64_t value, int spin);
++void     ggml_metal_moe_host_signal (uint64_t value);
++void     ggml_metal_moe_mark(ggml_metal_t ctx, uint64_t * v_done, uint64_t * v_go);
++void     ggml_metal_moe_inbuf_host_wait  (uint64_t value, int spin);
++void     ggml_metal_moe_inbuf_host_signal(uint64_t value);
++
+ void ggml_metal_set_n_cb            (ggml_metal_t ctx, int n_cb);
+ void ggml_metal_set_abort_callback  (ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index e906466..46007fc 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -84,6 +84,15 @@
+     bool has_error;
+ };
+ 
++// (tq expert cache) MoE expert cache, asynchronous in-buffer mode: every graph_compute is ONE command buffer that starts with a
++// wait for the pending "go" value (if any) and ends with a "done" signal (see ggml_metal_moe_mark)
++static bool     g_moe_inbuf = false;
++static uint64_t g_moe_pending_go = 0;
++static id<MTLSharedEvent> g_moe_done_ev = nil;
++static id<MTLSharedEvent> g_moe_go_ev   = nil;
++static uint64_t g_moe_done_last = 0; // value signalled at the end of the last encoded graph_compute
++static uint64_t g_moe_go_last   = 0;
++
+ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+     GGML_LOG_INFO("%s: allocating\n", __func__);
+ 
+@@ -701,6 +710,105 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
+     }
+ }
+ 
++void ggml_metal_moe_mark(ggml_metal_t ctx, uint64_t * v_done, uint64_t * v_go) {
++    if (!g_moe_inbuf) {
++        id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(ctx->dev);
++        g_moe_done_ev = [device newSharedEvent];
++        g_moe_go_ev   = [device newSharedEvent];
++        ggml_metal_set_n_cb(ctx, 0);
++        g_moe_inbuf = true;
++        // nothing has signalled yet: the caller waits for the last graph_compute to complete the old way
++        ggml_metal_synchronize(ctx);
++        *v_done = 0;
++    } else {
++        *v_done = g_moe_done_last;
++    }
++    GGML_ASSERT(g_moe_pending_go == 0);
++    g_moe_pending_go = ++g_moe_go_last;
++    *v_go = g_moe_pending_go;
++}
++
++void ggml_metal_moe_inbuf_host_wait(uint64_t value, int spin) {
++    if (value == 0) {
++        return;
++    }
++    @autoreleasepool {
++        if (spin) {
++            while ([g_moe_done_ev signaledValue] < value) {
++            }
++        } else if (![g_moe_done_ev waitUntilSignaledValue:value timeoutMS:600000]) {
++            GGML_ABORT("%s: timeout", __func__);
++        }
++    }
++}
++
++void ggml_metal_moe_inbuf_host_signal(uint64_t value) {
++    @autoreleasepool {
++        g_moe_go_ev.signaledValue = value;
++    }
++}
++
++// (tq expert cache) MoE expert cache, asynchronous mode
++static id<MTLSharedEvent> g_moe_done = nil; // GPU -> host: the work before this point is complete
++static id<MTLSharedEvent> g_moe_go   = nil; // host -> GPU: the experts of the next layer are in place
++static uint64_t g_moe_done_v = 0;
++static uint64_t g_moe_go_v   = 0;
++
++static void ggml_metal_moe_init(ggml_metal_t ctx) {
++    if (g_moe_done == nil) {
++        id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(ctx->dev);
++        g_moe_done = [device newSharedEvent];
++        g_moe_go   = [device newSharedEvent];
++    }
++}
++
++uint64_t ggml_metal_moe_signal_point(ggml_metal_t ctx) {
++    @autoreleasepool {
++        ggml_metal_moe_init(ctx);
++        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
++        id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
++        const uint64_t v = ++g_moe_done_v;
++        [cmd_buf encodeSignalEvent:g_moe_done value:v];
++        [cmd_buf commit];
++        [ctx->cmd_bufs_ext addObject:cmd_buf];
++        ctx->cmd_buf_last = cmd_buf;
++        [cmd_buf retain];
++        return v;
++    }
++}
++
++uint64_t ggml_metal_moe_wait_point(ggml_metal_t ctx) {
++    @autoreleasepool {
++        ggml_metal_moe_init(ctx);
++        id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
++        id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
++        const uint64_t v = ++g_moe_go_v;
++        [cmd_buf encodeWaitForEvent:g_moe_go value:v];
++        [cmd_buf commit];
++        [ctx->cmd_bufs_ext addObject:cmd_buf];
++        ctx->cmd_buf_last = cmd_buf;
++        [cmd_buf retain];
++        return v;
++    }
++}
++
++void ggml_metal_moe_host_wait(uint64_t value, int spin) {
++    @autoreleasepool {
++        if (spin) {
++            while ([g_moe_done signaledValue] < value) {
++            }
++        } else if (![g_moe_done waitUntilSignaledValue:value timeoutMS:600000]) {
++            GGML_ABORT("%s: timeout", __func__);
++        }
++    }
++}
++
++void ggml_metal_moe_host_signal(uint64_t value) {
++    @autoreleasepool {
++        g_moe_go.signaledValue = value;
++    }
++}
++
+ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
+     return ctx->ev_cpy;
+ }
+@@ -743,6 +851,12 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+ 
+         id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+ 
++        const bool moe_inbuf = g_moe_inbuf && cb_idx == n_cb_l; // n_cb is 0 in this mode: the only command buffer
++        if (moe_inbuf && g_moe_pending_go != 0) {
++            [cmd_buf encodeWaitForEvent:g_moe_go_ev value:g_moe_pending_go];
++            g_moe_pending_go = 0;
++        }
++
+         ggml_metal_op_t ctx_op = ggml_metal_op_init(
+             ctx->dev,
+             cmd_buf,
+@@ -765,6 +879,10 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+ 
+         ggml_metal_op_free(ctx_op);
+ 
++        if (moe_inbuf) {
++            [cmd_buf encodeSignalEvent:g_moe_done_ev value:++g_moe_done_last];
++        }
++
+         if (cb_idx < 2 || ctx->abort_callback == NULL) {
+             [cmd_buf commit];
+         }
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 83121a9..0942097 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1321,7 +1321,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(g
+     }
+ 
+     // per expert: entry count + base offset, followed by the staging of the ids of ntg tokens
+-    res.smem = 2*(size_t) ne02*sizeof(uint32_t) + (size_t) ne02*ne20*sizeof(uint16_t);
++    res.smem = 3*(size_t) ne02*sizeof(uint32_t) + (size_t) ne02*ne20*sizeof(uint16_t); // (tq expert cache) + slot_of
+     res.smem = GGML_PAD(res.smem, 16);
+ 
+     return res;
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index fe18b43..350b7ba 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -575,6 +575,7 @@ typedef struct {
+     int32_t  ne21; // n_tokens
+     int32_t  ne20;  // n_expert_used
+     uint64_t nb21;
++    int32_t  pk_shift; // (tq expert cache) 0: ids are experts; >0: ids = expert | slot << pk_shift, tiles address the slot
+ } ggml_metal_kargs_mul_mm_id_map0;
+ 
+ typedef struct {
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index c9e647f..f10d63d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2914,6 +2914,14 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+     const uint32_t r2 = 1;
+     const uint32_t r3 = 1;
+ 
++    // (tq expert cache) packed ids from the MoE cache: expert | slot << pk_shift; only the mat-mat path understands them
++    const int32_t pk_shift = ggml_get_op_params_i32(op, 6);
++    const int32_t ne02_map = pk_shift > 0 ? ggml_get_op_params_i32(op, 7) : ne02;
++
++    if (pk_shift > 0) {
++        GGML_ASSERT(ggml_metal_op_mul_mat_id_use_mm(op, props_dev->has_simdgroup_mm) && "packed MoE-cache ids need the mat-mat path");
++    }
++
+     if (ggml_metal_op_mul_mat_id_use_mm(op, props_dev->has_simdgroup_mm)) {
+         // some Metal matrix data types require aligned pointers
+         // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf (Table 2.5)
+@@ -2973,13 +2981,14 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+                 ne21, // n_tokens
+                 ne20, // n_expert_used
+                 nb21,
++                pk_shift,
+             };
+ 
+-            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02, ne20);
++            auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_map0(lib, ne02_map, ne20);
+ 
+             const size_t smem = pipeline.smem;
+ 
+-            GGML_ASSERT(ne02 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
++            GGML_ASSERT(ne02_map <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+ 
+             GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+ 
+@@ -2991,7 +3000,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+ 
+             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+ 
+-            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02, 1, 1);
++            ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, ne02_map, 1, 1);
+         }
+ 
+         ggml_metal_op_concurrency_reset(ctx);
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index 0926136..1a3997d 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -945,7 +945,37 @@ static void ggml_backend_metal_fusion_set_enabled(ggml_backend_fusion_t finfo, b
+     ggml_metal_fusion_info_set_enabled((struct ggml_metal_fusion_info *) finfo, enabled);
+ }
+ 
++// (tq expert cache) MoE expert cache, asynchronous mode (see ggml-metal-context.h)
++static uint64_t ggml_backend_metal_moe_signal_point(ggml_backend_t backend) { return ggml_metal_moe_signal_point((ggml_metal_t) backend->context); }
++static uint64_t ggml_backend_metal_moe_wait_point  (ggml_backend_t backend) { return ggml_metal_moe_wait_point  ((ggml_metal_t) backend->context); }
++static void     ggml_backend_metal_moe_host_wait   (uint64_t value, int spin) { ggml_metal_moe_host_wait(value, spin); }
++static void     ggml_backend_metal_moe_host_signal (uint64_t value) { ggml_metal_moe_host_signal(value); }
++static void     ggml_backend_metal_moe_mark(ggml_backend_t backend, uint64_t * v_done, uint64_t * v_go) { ggml_metal_moe_mark((ggml_metal_t) backend->context, v_done, v_go); }
++static void     ggml_backend_metal_moe_inbuf_host_wait  (uint64_t value, int spin) { ggml_metal_moe_inbuf_host_wait(value, spin); }
++static void     ggml_backend_metal_moe_inbuf_host_signal(uint64_t value) { ggml_metal_moe_inbuf_host_signal(value); }
++
+ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, "ggml_backend_metal_moe_mark") == 0) {
++        return (void *)ggml_backend_metal_moe_mark;
++    }
++    if (strcmp(name, "ggml_backend_metal_moe_inbuf_host_wait") == 0) {
++        return (void *)ggml_backend_metal_moe_inbuf_host_wait;
++    }
++    if (strcmp(name, "ggml_backend_metal_moe_inbuf_host_signal") == 0) {
++        return (void *)ggml_backend_metal_moe_inbuf_host_signal;
++    }
++    if (strcmp(name, "ggml_backend_metal_moe_signal_point") == 0) {
++        return (void *)ggml_backend_metal_moe_signal_point;
++    }
++    if (strcmp(name, "ggml_backend_metal_moe_wait_point") == 0) {
++        return (void *)ggml_backend_metal_moe_wait_point;
++    }
++    if (strcmp(name, "ggml_backend_metal_moe_host_wait") == 0) {
++        return (void *)ggml_backend_metal_moe_host_wait;
++    }
++    if (strcmp(name, "ggml_backend_metal_moe_host_signal") == 0) {
++        return (void *)ggml_backend_metal_moe_host_signal;
++    }
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_metal_get_features;
+     }
+diff --git a/ggml/src/ggml-metal/kernels/mul_mm.metal b/ggml/src/ggml-metal/kernels/mul_mm.metal
+index 5e66b11..276bf51 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
+@@ -483,8 +483,13 @@ kernel void kernel_mul_mm_id_map0(
+     threadgroup uint32_t * cnt = (threadgroup uint32_t *) (shmem);
+     threadgroup uint32_t * bas = cnt + FC_mul_mm_id_map0_ne02;
+ 
++    // (tq expert cache) packed ids: the slot of each expert (written while staging, read when the tiles are emitted)
++    threadgroup uint32_t * slot_of = bas + FC_mul_mm_id_map0_ne02;
++
+     // staging of the ids of ntg tokens
+-    threadgroup uint16_t * sids = (threadgroup uint16_t *) (bas + FC_mul_mm_id_map0_ne02);
++    threadgroup uint16_t * sids = (threadgroup uint16_t *) (slot_of + FC_mul_mm_id_map0_ne02);
++
++    const int32_t pk_mask = args.pk_shift ? (1 << args.pk_shift) - 1 : -1;
+ 
+     // pass 1: count the entries of this expert - every occurrence of this expert within the
+     // ids is an entry (duplicate ids produce multiple entries for the same token)
+@@ -495,7 +500,11 @@ kernel void kernel_mul_mm_id_map0(
+             device const int32_t * src2_i32 = (device const int32_t *) (src2 + (i21 + tpitg)*args.nb21);
+ 
+             FOR_UNROLL (short i20 = 0; i20 < ne20; i20++) {
+-                sids[tpitg*ne20 + i20] = src2_i32[i20];
++                const int32_t v = src2_i32[i20];
++                sids[tpitg*ne20 + i20] = v & pk_mask;
++                if (args.pk_shift) {
++                    slot_of[v & pk_mask] = (uint32_t) v >> args.pk_shift;
++                }
+             }
+         }
+ 
+@@ -537,7 +546,7 @@ kernel void kernel_mul_mm_id_map0(
+             bas[e] = base;
+ 
+             for (uint32_t k = 0; k < n; k += NTILE) {
+-                tpe_u32[1 + 3*tile    ] = e;
++                tpe_u32[1 + 3*tile    ] = args.pk_shift ? slot_of[e] : (uint32_t) e;
+                 tpe_u32[1 + 3*tile + 1] = base + k;
+                 tpe_u32[1 + 3*tile + 2] = n - k < NTILE ? n - k : NTILE;
+ 
+@@ -562,7 +571,7 @@ kernel void kernel_mul_mm_id_map0(
+             device const int32_t * src2_i32 = (device const int32_t *) (src2 + (i21 + tpitg)*args.nb21);
+ 
+             FOR_UNROLL (short i20 = 0; i20 < ne20; i20++) {
+-                sids[tpitg*ne20 + i20] = src2_i32[i20];
++                sids[tpitg*ne20 + i20] = src2_i32[i20] & pk_mask;
+             }
+         }
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..bec8bbf 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -359,6 +359,10 @@ llama_context::llama_context(
+     cparams.op_offload     = params.op_offload;
+     cparams.kv_unified     = params.kv_unified;
+     cparams.moe_cache_size = params.moe_cache_size;
++    // (tq expert cache) LLAMA_MOE_CACHE_MIB for tools without the option (llama-bench)
++    if (cparams.moe_cache_size == 0 && getenv("LLAMA_MOE_CACHE_MIB") != nullptr) {
++        cparams.moe_cache_size = (size_t) atoll(getenv("LLAMA_MOE_CACHE_MIB"))*1024*1024;
++    }
+ 
+     // initialized later
+     cparams.pipeline_parallel = false;
+@@ -2767,6 +2771,13 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+         return true;
+     }
+ 
++    // (tq expert cache) with GGML_SCHED_COPY_CB_FIRST the scheduler has not synchronized the backend yet: do it before the
++    // large-batch expert copy below overwrites dst
++    static const bool cb_first = getenv("GGML_SCHED_COPY_CB_FIRST") != nullptr && atoi(getenv("GGML_SCHED_COPY_CB_FIRST")) != 0;
++    if (cb_first) {
++        ggml_backend_synchronize(backend);
++    }
++
+     auto & st = lctx->copy_experts;
+ 
+     // the ids must be computed before the split starts, so only the first node of the split is considered
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 2bc3a29..67ba243 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1678,6 +1678,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+         ggml_mul_mat_id(ctx0, w, cur, ids) :
+         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+ 
++    // (tq expert cache) from 32 tokens Metal uses the mat-mat kernel, whose prepass is limited to 1024 experts: the cache hands it
++    // packed ids (expert | slot << 10, see llama_moe_cache::copy) so it groups by expert as without the cache and reads the slot
++    if (slots != nullptr && slots->ne[1] >= LLAMA_MOE_CACHE_PACK_MIN_TOKENS) {
++        res->op_params[6] = LLAMA_MOE_CACHE_PACK_SHIFT;
++        res->op_params[7] = (int32_t) w->ne[2];
++    }
++
+     if (prec_policy) {
+         prec_policy->apply(res);
+     }
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 9cf2771..b789141 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1093,14 +1093,14 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
+     return ggml_backend_dev_buffer_type(cpu_dev);
+ }
+ 
+-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
+-    if (mode == LLAMA_LAZY_MODE_OFF) {
++bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force) {
++    if (mode == LLAMA_LAZY_MODE_OFF && !force) {
+         return false;
+     }
+ 
+     // do not lazy-read small tensors, it has significant overhead and is not worth it
+     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
+-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
++    if (!force && mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+         return false;
+     }
+ 
+@@ -1352,6 +1352,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+     }
+ 
++    // (tq expert cache) LLAMA_MOE_SSD=1: the routed experts stay in the file (mapped, never touched); the MoE cache reads them with pread
++    if (!is_lazy && getenv("LLAMA_MOE_SSD") != nullptr && atoi(getenv("LLAMA_MOE_SSD")) != 0 &&
++            tn.str().find("_exps.weight") != std::string::npos) {
++        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()), true);
++    }
++
+     ggml_tensor t_meta = *cur;
+     if (flags & TENSOR_ALLOW_RESHAPE) {
+         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index ed59079..36b0897 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -90,7 +90,8 @@ struct llama_model_loader {
+ 
+         // decide whether this tensor is read lazily
+         // pass w to also record it, or nullptr to only ask
+-        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
++        // force: (tq expert cache) read lazily whatever the mode and size (routed experts read by the MoE cache with pread)
++        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force = false);
+ 
+         bool any() const {
+             return !ranges.empty();
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 803a832..d842d42 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1,5 +1,10 @@
+ #include "llama-model.h"
+ 
++#ifdef __APPLE__
++#include <fcntl.h>
++#include <limits.h>
++#endif
++
+ #include "llama-arch.h"
+ #include "llama-ext.h"
+ #include "llama-hparams.h"
+@@ -1890,6 +1895,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
++    // (tq expert cache) record the file of each mapping (path from the descriptor, macOS F_GETPATH)
++    file_maps.clear();
++    for (size_t idx = 0; idx < ml.mappings.size(); ++idx) {
++        file_map fm;
++#ifdef __APPLE__
++        char path[PATH_MAX] = {0};
++        if (fcntl(ml.files.at(idx)->file_id(), F_GETPATH, path) == 0) {
++            fm.path = path;
++        }
++#endif
++        fm.addr = ml.mappings.at(idx) ? ml.mappings.at(idx)->addr() : nullptr;
++        fm.size = ml.mappings.at(idx) ? ml.mappings.at(idx)->size() : 0;
++        file_maps.push_back(fm);
++    }
++
+     // create the backend buffers
+     // note: the buffers are owned by pimpl->ctxs_bufs, this is a raw-pointer view used to load the data
+     std::vector<std::pair<ggml_context *, std::vector<ggml_backend_buffer_t>>> ctx_bufs;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index a187c27..5f0d643 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -850,6 +850,14 @@ struct llama_model {
+     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
+     std::unordered_set<const ggml_tensor *> can_prefetch;
+ 
++    // (tq expert cache) the mmap of each model file, so host tensors can be re-read from the file with pread (see llama-moe-cache.cpp)
++    struct file_map {
++        std::string  path;
++        const void * addr = nullptr;
++        size_t       size = 0;
++    };
++    std::vector<file_map> file_maps;
++
+     // statically allocated context for assigning
+     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+ 
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index f22d986..f7c3d7f 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -6,7 +6,19 @@
+ #include "ggml-cpp.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
+ #include <stdexcept>
++#include <string>
++#include <thread>
++
++#include <fcntl.h>
++#include <unistd.h>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -150,6 +162,107 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
+ 
+ }
+ 
++
++// (tq expert cache) a fixed pool of reader threads: each job is one pread into device-visible (shared) memory
++struct moe_ssd_pool {
++    struct job {
++        int     fd;
++        void *  dst;
++        size_t  size;
++        off_t   off;
++    };
++
++    std::vector<std::thread> threads;
++    std::mutex mtx;
++    std::condition_variable cv_work;
++    std::condition_variable cv_done;
++    std::vector<job> jobs;
++    size_t next = 0;
++    size_t n_done = 0;
++    bool stop = false;
++    std::atomic<int> n_err { 0 };
++
++    void start(int n) {
++        for (int i = 0; i < n; ++i) {
++            threads.emplace_back([this] { worker(); });
++        }
++    }
++
++    ~moe_ssd_pool() {
++        {
++            std::lock_guard<std::mutex> lk(mtx);
++            stop = true;
++        }
++        cv_work.notify_all();
++        for (auto & t : threads) {
++            t.join();
++        }
++    }
++
++    void worker() {
++        for (;;) {
++            job j;
++            {
++                std::unique_lock<std::mutex> lk(mtx);
++                cv_work.wait(lk, [this] { return stop || next < jobs.size(); });
++                if (stop) {
++                    return;
++                }
++                j = jobs[next++];
++            }
++            size_t got = 0;
++            while (got < j.size) {
++                const ssize_t r = pread(j.fd, (uint8_t *) j.dst + got, j.size - got, j.off + (off_t) got);
++                if (r <= 0) {
++                    n_err++;
++                    break;
++                }
++                got += (size_t) r;
++            }
++            {
++                std::lock_guard<std::mutex> lk(mtx);
++                n_done++;
++                if (n_done == jobs.size()) {
++                    cv_done.notify_all();
++                }
++            }
++        }
++    }
++
++    // run all jobs in parallel and wait for them
++    void run(std::vector<job> & js) {
++        if (js.empty()) {
++            return;
++        }
++        {
++            std::lock_guard<std::mutex> lk(mtx);
++            jobs.swap(js);
++            next = 0;
++            n_done = 0;
++        }
++        cv_work.notify_all();
++        {
++            std::unique_lock<std::mutex> lk(mtx);
++            cv_done.wait(lk, [this] { return n_done == jobs.size(); });
++            jobs.swap(js);
++            jobs.clear();
++            next = 0;
++        }
++        if (n_err.load() != 0) {
++            GGML_ABORT("llama_moe_cache: pread failed");
++        }
++    }
++};
++
++static int64_t moe_now_ns() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++static long moe_env_long(const char * name, long def) {
++    const char * v = getenv(name);
++    return v ? atol(v) : def;
++}
++
+ struct llama_moe_cache::impl {
+     // a GPU with its own budget and banks, it caches the layers assigned to it
+     struct device {
+@@ -193,7 +306,71 @@ struct llama_moe_cache::impl {
+         size_t bytes  = 0;
+     };
+ 
+-    static constexpr int64_t max_batch = 32;
++    // upstream 32; LLAMA_MOE_CACHE_MAX_BATCH raises it so prefill also goes through the cache (as in the offload simulation)
++    int64_t max_batch = 32;
++
++    // (tq expert cache) LLAMA_MOE_SSD=1: misses are read from the model file with pread (F_NOCACHE), not copied from host memory
++    bool ssd = false;
++    std::vector<int> ssd_fds;                  // per model file
++    std::vector<std::vector<int>>   ssd_fd_of; // [il][ip] index into ssd_fds
++    std::vector<std::vector<off_t>> ssd_off;   // [il][ip] file offset of expert 0
++    std::unique_ptr<moe_ssd_pool> pool;
++    std::vector<moe_ssd_pool::job> jobs;
++    // macOS serves only the first 1 MiB of an F_NOCACHE read uncached: the rest of a larger read lands in the page cache
++    // (measured 10-22 with mincore: 2 MiB reads leave 50 %, 3,072,000 B reads 66 % resident) -> reads are split at 1 MiB
++    size_t ssd_chunk = 1u << 20;
++
++    // (tq expert cache) timing and per-ubatch records (LLAMA_MOE_STATS=path appends one line per ubatch)
++    struct timing {
++        int64_t wait_ns = 0; // waiting for the device (previous split) inside the callback
++        int64_t io_ns   = 0; // preads
++        int64_t cb_ns   = 0; // whole callback
++        size_t  n_cb    = 0;
++        size_t  n_cb_miss = 0; // callbacks with at least one miss
++    };
++    timing tm_small, tm_large;
++    FILE * stats_fp = nullptr;
++    int32_t first_layer = -1;
++    struct ub_rec {
++        int64_t t0 = 0;
++        int64_t n_ids = 0;
++        size_t hits = 0, misses = 0, bytes = 0, n_cb_miss = 0;
++        int64_t wait_ns = 0, io_ns = 0, cb_ns = 0;
++    } ub;
++    size_t n_ub = 0;
++    std::vector<size_t> layer_miss_small; // decode-class misses per layer
++    std::vector<std::vector<int32_t>> packed; // [il] packed slot map of the last large ubatch (kept alive for the async copy)
++
++    // (tq expert cache) LLAMA_MOE_ASYNC=1 (needs GGML_SCHED_COPY_CB_FIRST=1 and the Metal backend): the scheduler does not wait for
++    // the GPU at each layer. The copy callback only marks two points in the GPU queue - "done" (the router of this layer has run)
++    // and "go" (the GPU waits here) - and hands the layer to a resolver thread, which waits for "done", reads the selected experts,
++    // reads the misses from the SSD, writes the slot map into the device copy and signals "go". The main thread keeps encoding the
++    // next layers meanwhile, as without the cache.
++    bool async = false;
++    int  async_spin = 1;
++    uint64_t (*fn_signal_point)(ggml_backend_t) = nullptr;
++    uint64_t (*fn_wait_point)(ggml_backend_t)   = nullptr;
++    void     (*fn_host_wait)(uint64_t, int)     = nullptr;
++    void     (*fn_host_signal)(uint64_t)        = nullptr;
++    // in-buffer mode (default): the wait/signal are encoded into the split's own command buffer (one per split), see ggml_metal_moe_mark
++    bool inbuf = true;
++    void     (*fn_mark)(ggml_backend_t, uint64_t *, uint64_t *) = nullptr;
++    struct async_job {
++        int32_t il;
++        const int32_t * sel;  // selected experts, host-visible device memory
++        int64_t n_ids;
++        int32_t * dst;        // device copy of the slot map, host-visible device memory
++        int64_t n_dst;
++        uint64_t v_done;
++        uint64_t v_go;
++    };
++    std::thread resolver;
++    std::mutex a_mtx;
++    std::condition_variable a_cv;
++    std::vector<async_job> a_queue;
++    size_t a_head = 0;
++    bool a_stop = false;
++    int64_t stall_ns_small = 0, stall_ns_large = 0; // GPU held at "go" by the resolver (from "done" seen to "go" signalled)
+ 
+     int32_t n_expert_used;
+ 
+@@ -220,6 +397,11 @@ struct llama_moe_cache::impl {
+ 
+     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
++        max_batch = moe_env_long("LLAMA_MOE_CACHE_MAX_BATCH", 32);
++        ssd       = moe_env_long("LLAMA_MOE_SSD", 0) != 0;
++        ssd_chunk = std::min((size_t) moe_env_long("LLAMA_MOE_SSD_CHUNK", (long) ssd_chunk), (size_t) 1u << 20);
++        layer_miss_small.assign(model.layers.size(), 0);
++        packed.resize(model.layers.size());
+         for (size_t i = 0; i < backends.size(); ++i) {
+             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
+             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+@@ -435,6 +617,31 @@ struct llama_moe_cache::impl {
+         }
+         ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+ 
++        if (ssd && !model.hparams.no_alloc) {
++            init_ssd(model);
++            if (moe_env_long("LLAMA_MOE_ASYNC", 0) != 0) {
++                init_async();
++            }
++        }
++        if (const char * sp = getenv("LLAMA_MOE_STATS"); sp != nullptr && !model.hparams.no_alloc) {
++            stats_fp = fopen(sp, "a");
++            if (stats_fp) {
++                fprintf(stats_fp, "# moe_cache start pid %d slots %d max_batch %lld ssd %d threads %ld\n", (int) getpid(),
++                    groups.empty() ? 0 : groups[0].n_slots, (long long) max_batch, (int) ssd, moe_env_long("LLAMA_MOE_SSD_THREADS", 16));
++                fprintf(stats_fp, "# ub t_start_ns n_ids hits misses bytes n_cb_miss wait_us io_us cb_us\n");
++                fflush(stats_fp);
++            }
++        }
++        for (size_t il = 0; il < layers.size(); ++il) {
++            if (layers[il].ig >= 0) {
++                first_layer = (int32_t) il;
++                break;
++            }
++        }
++        if (ssd && !model.hparams.no_alloc && moe_env_long("LLAMA_MOE_PRELOAD", 0) != 0) {
++            preload();
++        }
++
+         for (size_t id = 0; id < devices.size(); ++id) {
+             const device & d = devices[id];
+             if (d.host_bytes == 0) {
+@@ -451,12 +658,211 @@ struct llama_moe_cache::impl {
+         }
+     }
+ 
++    void init_ssd(const llama_model & model) {
++        std::vector<int> fd_of_file(model.file_maps.size(), -1);
++        ssd_fd_of.assign(layers.size(), {});
++        ssd_off.assign(layers.size(), {});
++        size_t n_tensors = 0;
++        for (size_t il = 0; il < layers.size(); ++il) {
++            const layer & l = layers[il];
++            if (l.ig < 0) {
++                continue;
++            }
++            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                const ggml_tensor * w = l.experts[ip];
++                const uint8_t * p = (const uint8_t *) w->data;
++                int64_t ifile = -1;
++                for (size_t f = 0; f < model.file_maps.size(); ++f) {
++                    const uint8_t * a = (const uint8_t *) model.file_maps[f].addr;
++                    if (a != nullptr && p >= a && p + ggml_nbytes(w) <= a + model.file_maps[f].size) {
++                        ifile = (int64_t) f;
++                        break;
++                    }
++                }
++                if (ifile < 0 || model.file_maps[ifile].path.empty()) {
++                    GGML_ABORT("llama_moe_cache: %s is not in a mapped model file (LLAMA_MOE_SSD needs the experts mapped)", w->name);
++                }
++                if (fd_of_file[ifile] < 0) {
++                    const int fd = open(model.file_maps[ifile].path.c_str(), O_RDONLY);
++                    if (fd < 0) {
++                        GGML_ABORT("llama_moe_cache: cannot open %s", model.file_maps[ifile].path.c_str());
++                    }
++#ifdef __APPLE__
++                    if (fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0) {
++                        GGML_ABORT("llama_moe_cache: F_NOCACHE/F_RDAHEAD failed on %s", model.file_maps[ifile].path.c_str());
++                    }
++#endif
++                    fd_of_file[ifile] = (int) ssd_fds.size();
++                    ssd_fds.push_back(fd);
++                }
++                ssd_fd_of[il].push_back(fd_of_file[ifile]);
++                ssd_off[il].push_back((off_t) (p - (const uint8_t *) model.file_maps[ifile].addr));
++                n_tensors++;
++            }
++        }
++        for (const group & g : groups) {
++            for (const ggml_tensor * bank : g.banks) {
++                // Metal shared buffers are host memory (newBufferWithBytesNoCopy) but report is_host = false; private ones are named *_Private
++                const char * bn = bank->buffer ? ggml_backend_buffer_name(bank->buffer) : "";
++                const bool host_visible = bank->buffer != nullptr && (ggml_backend_buffer_is_host(bank->buffer) ||
++                    (strncmp(bn, "MTL", 3) == 0 && strstr(bn, "_Private") == nullptr));
++                if (!host_visible || bank->data == nullptr) {
++                    GGML_ABORT("llama_moe_cache: LLAMA_MOE_SSD needs host-visible (shared) cache banks");
++                }
++            }
++        }
++        const int n_threads = (int) moe_env_long("LLAMA_MOE_SSD_THREADS", 16);
++        pool = std::make_unique<moe_ssd_pool>();
++        pool->start(n_threads);
++        LLAMA_LOG_INFO("llama_moe_cache: SSD mode: %zu expert tensors in %zu files, F_NOCACHE, %d reader threads, max_batch %lld, chunk %zu\n",
++            n_tensors, ssd_fds.size(), n_threads, (long long) max_batch, ssd_chunk);
++    }
++
++    // (tq expert cache) LLAMA_MOE_PRELOAD=1: when a group's cache holds all of its experts, read them all at start (no misses later)
++    void preload() {
++        for (group & g : groups) {
++            if (g.n_slots == 0) {
++                continue;
++            }
++            const int32_t n_expert = g.ref[0]->ne[2];
++            if ((size_t) g.n_slots < g.layers.size()*(size_t) n_expert) {
++                LLAMA_LOG_WARN("llama_moe_cache: preload skipped, %d slots < %zu experts\n", g.n_slots, g.layers.size()*(size_t) n_expert);
++                continue;
++            }
++            std::vector<int32_t> all(n_expert);
++            for (int32_t e = 0; e < n_expert; ++e) {
++                all[e] = e;
++            }
++            const int64_t t0 = moe_now_ns();
++            size_t bytes = 0;
++            for (int32_t il : g.layers) {
++                size_t n_hit = 0;
++                GGML_ASSERT(g.lru.plan(il, all.data(), all.size(), fills, n_hit));
++                jobs.clear();
++                const layer & l = layers[il];
++                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                    const size_t expert_size = l.experts[ip]->nb[2];
++                    for (const auto & fl : fills) {
++                        uint8_t * dst = (uint8_t *) g.banks[ip]->data + (size_t) fl.slot*expert_size;
++                        const off_t off = ssd_off[il][ip] + (off_t) fl.expert*(off_t) expert_size;
++                        for (size_t c = 0; c < expert_size; c += ssd_chunk) {
++                            jobs.push_back({ ssd_fds[ssd_fd_of[il][ip]], dst + c, std::min(ssd_chunk, expert_size - c), off + (off_t) c });
++                        }
++                        bytes += expert_size;
++                    }
++                }
++                pool->run(jobs);
++            }
++            const double dt = (moe_now_ns() - t0)/1e9;
++            LLAMA_LOG_INFO("llama_moe_cache: preloaded %zu layers, %.2f GB in %.2f s = %.2f GB/s\n", g.layers.size(), bytes/1e9, dt, bytes/1e9/dt);
++            if (stats_fp) {
++                fprintf(stats_fp, "# preload %.0f bytes %.3f s %.3f GBps\n", (double) bytes, dt, bytes/1e9/dt);
++            }
++        }
++    }
++
++    void init_async() {
++        GGML_ASSERT(devices.size() == 1);
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(devices[0].backend));
++        fn_signal_point = (decltype(fn_signal_point)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_moe_signal_point");
++        fn_wait_point   = (decltype(fn_wait_point))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_moe_wait_point");
++        fn_host_wait    = (decltype(fn_host_wait))    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_moe_host_wait");
++        fn_host_signal  = (decltype(fn_host_signal))  ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_moe_host_signal");
++        inbuf = moe_env_long("LLAMA_MOE_ASYNC_INBUF", 1) != 0;
++        if (inbuf) {
++            fn_mark        = (decltype(fn_mark))        ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_moe_mark");
++            fn_host_wait   = (decltype(fn_host_wait))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_moe_inbuf_host_wait");
++            fn_host_signal = (decltype(fn_host_signal)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_moe_inbuf_host_signal");
++            GGML_ASSERT(fn_mark != nullptr);
++        }
++        if (!fn_signal_point || !fn_wait_point || !fn_host_wait || !fn_host_signal) {
++            GGML_ABORT("llama_moe_cache: LLAMA_MOE_ASYNC needs the Metal backend's MoE event functions");
++        }
++        if (getenv("GGML_SCHED_COPY_CB_FIRST") == nullptr || atoi(getenv("GGML_SCHED_COPY_CB_FIRST")) == 0) {
++            GGML_ABORT("llama_moe_cache: LLAMA_MOE_ASYNC needs GGML_SCHED_COPY_CB_FIRST=1");
++        }
++        // blocking wait by default: a resolver spinning on [MTLSharedEvent signaledValue] slowed decode from 62 to 34 tok/s (10-22)
++        async_spin = (int) moe_env_long("LLAMA_MOE_ASYNC_SPIN", 0);
++        async = true;
++        resolver = std::thread([this] { resolver_loop(); });
++        LLAMA_LOG_INFO("llama_moe_cache: asynchronous mode (resolver thread, %s wait, %s)\n", async_spin ? "spin" : "blocking",
++            inbuf ? "events inside the split command buffers" : "separate event command buffers");
++    }
++
++    void resolver_loop() {
++        for (;;) {
++            async_job j;
++            {
++                std::unique_lock<std::mutex> lk(a_mtx);
++                a_cv.wait(lk, [this] { return a_stop || a_head < a_queue.size(); });
++                if (a_head >= a_queue.size()) {
++                    return; // stop requested and drained
++                }
++                j = a_queue[a_head++];
++                if (a_head == a_queue.size()) {
++                    a_queue.clear();
++                    a_head = 0;
++                }
++            }
++            const int64_t t0 = moe_now_ns();
++            if (j.il == first_layer) {
++                flush_ub();
++                ub.t0 = t0;
++            }
++            fn_host_wait(j.v_done, async_spin);
++            const int64_t t1 = moe_now_ns();
++            ids.assign(j.sel, j.sel + j.n_ids);
++            resolve(j.il, t1 - t0, t1, [&](const int32_t * data, size_t nbytes) { memcpy(j.dst, data, nbytes); });
++            if (j.v_go != 0) {
++                fn_host_signal(j.v_go);
++            }
++            const int64_t stall = moe_now_ns() - t1;
++            (j.n_ids <= 8*n_expert_used ? stall_ns_small : stall_ns_large) += stall;
++        }
++    }
++
++    void flush_ub() {
++        if (stats_fp && ub.n_ids > 0) {
++            fprintf(stats_fp, "%zu %lld %lld %zu %zu %zu %zu %.1f %.1f %.1f\n", n_ub, (long long) ub.t0, (long long) ub.n_ids,
++                ub.hits, ub.misses, ub.bytes, ub.n_cb_miss, ub.wait_ns/1e3, ub.io_ns/1e3, ub.cb_ns/1e3);
++            fflush(stats_fp);
++        }
++        if (ub.n_ids > 0) {
++            n_ub++;
++        }
++        ub = ub_rec();
++    }
++
+     ggml_backend_t backend(int32_t il) const {
+         return devices[groups[layers[il].ig].id].backend;
+     }
+ 
+     ~impl() {
++        if (resolver.joinable()) {
++            {
++                std::lock_guard<std::mutex> lk(a_mtx);
++                a_stop = true;
++            }
++            a_cv.notify_all();
++            resolver.join();
++        }
++        flush_ub();
++        if (stats_fp) {
++            fprintf(stats_fp, "# layer_miss_small");
++            for (size_t m : layer_miss_small) {
++                fprintf(stats_fp, " %zu", m);
++            }
++            fprintf(stats_fp, "\n# totals small hits %zu misses %zu bytes %zu | large hits %zu misses %zu bytes %zu\n",
++                stats_small.hits, stats_small.misses, stats_small.bytes, stats_large.hits, stats_large.misses, stats_large.bytes);
++        }
+         log_stats();
++        pool.reset();
++        for (int fd : ssd_fds) {
++            close(fd);
++        }
++        if (stats_fp) {
++            fclose(stats_fp);
++        }
+     }
+ 
+     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
+@@ -467,6 +873,11 @@ struct llama_moe_cache::impl {
+ 
+         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
+         if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
++            if (ssd && n_tokens > 0) {
++                // the fallback would read the host experts through the mapping (page cache): not allowed in SSD mode
++                GGML_ABORT("llama_moe_cache: SSD mode: layer %d with %lld tokens cannot use the cache (max_batch %lld, %d slots); raise LLAMA_MOE_CACHE_MAX_BATCH or lower -ub",
++                    il, (long long) n_tokens, (long long) max_batch, groups[l.ig].n_slots);
++            }
+             return nullptr;
+         }
+         return l.slot_map;
+@@ -545,9 +956,53 @@ struct llama_moe_cache::impl {
+         }
+         GGML_ASSERT(ggml_is_contiguous(sel));
+ 
++        if (async) {
++            // (tq expert cache) mark "done" and "go" in the GPU queue and hand the layer to the resolver thread
++            GGML_ASSERT(sel->data != nullptr && dst->data != nullptr && ggml_is_contiguous(dst));
++            async_job j;
++            j.il     = il;
++            j.sel    = (const int32_t *) sel->data;
++            j.n_ids  = ggml_nelements(sel);
++            j.dst    = (int32_t *) dst->data;
++            j.n_dst  = ggml_nelements(dst);
++            if (inbuf) {
++                fn_mark(backend, &j.v_done, &j.v_go);
++            } else {
++                j.v_done = fn_signal_point(backend);
++                // LLAMA_MOE_ASYNC_NOWAIT=1: DIAGNOSTIC ONLY (wrong results on misses): no GPU wait point, to time the wait itself
++                static const bool nowait = moe_env_long("LLAMA_MOE_ASYNC_NOWAIT", 0) != 0;
++                j.v_go   = nowait ? 0 : fn_wait_point(backend);
++            }
++            {
++                std::lock_guard<std::mutex> lk(a_mtx);
++                a_queue.push_back(j);
++            }
++            a_cv.notify_one();
++            return true;
++        }
++
++        const int64_t t_cb0 = moe_now_ns();
++        if (il == first_layer) {
++            flush_ub();
++            ub.t0 = t_cb0;
++        }
++
+         ids.resize(ggml_nelements(sel));
+         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
+         ggml_backend_synchronize(backend);
++        const int64_t t_wait = moe_now_ns() - t_cb0;
++
++        // the next copy synchronizes the backend before it changes the slot map again
++        resolve(il, t_wait, t_cb0, [&](const int32_t * data, size_t nbytes) { ggml_backend_tensor_set_async(backend, dst, data, 0, nbytes); }, backend);
++
++        return true;
++    }
++
++    // plan the slots of the selected experts (ids), load the misses, write the slot map with put_slot_map, record the stats
++    template <typename F>
++    void resolve(int32_t il, int64_t t_wait, int64_t t_cb0, F && put_slot_map, ggml_backend_t backend = nullptr) {
++        const layer & l = layers[il];
++        group & g = groups[l.ig];
+ 
+         size_t n_hit = 0;
+         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+@@ -556,7 +1011,30 @@ struct llama_moe_cache::impl {
+ 
+         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+         size_t bytes = 0;
+-        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++        int64_t t_io = 0;
++        if (ssd) {
++            const int64_t t_io0 = moe_now_ns();
++            jobs.clear();
++            for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                const ggml_tensor * w    = l.experts[ip];
++                ggml_tensor       * bank = g.banks[ip];
++                const size_t expert_size = w->nb[2];
++                const int    fd          = ssd_fds[ssd_fd_of[il][ip]];
++                const off_t  off0        = ssd_off[il][ip];
++                // one read per expert and tensor (1,024,000 B here), never merged: reads above 1 MiB would partly go through the page cache
++                for (const auto & fl : fills) {
++                    uint8_t * dst = (uint8_t *) bank->data + (size_t) fl.slot*expert_size;
++                    const off_t off = off0 + (off_t) fl.expert*(off_t) expert_size;
++                    for (size_t c = 0; c < expert_size; c += ssd_chunk) {
++                        jobs.push_back({ fd, dst + c, std::min(ssd_chunk, expert_size - c), off + (off_t) c });
++                    }
++                    bytes += expert_size;
++                }
++            }
++            pool->run(jobs);
++            t_io = moe_now_ns() - t_io0;
++        }
++        for (size_t ip = 0; ip < l.experts.size() && !ssd; ++ip) {
+             const ggml_tensor * w    = l.experts[ip];
+             ggml_tensor       * bank = g.banks[ip];
+             const size_t expert_size = w->nb[2];
+@@ -576,10 +1054,42 @@ struct llama_moe_cache::impl {
+         st.misses += fills.size();
+         st.bytes  += bytes;
+ 
+-        // the next copy synchronizes the backend before it changes the slot map again
+-        ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
++        // the slot map: plain slots, or packed ids for the mat-mat path (see build_lora_mm_id)
++        const int32_t * sm = (const int32_t *) l.slot_map->data;
++        const int64_t ne = ggml_nelements(l.slot_map);
++        if ((int64_t) ids.size() >= (int64_t) LLAMA_MOE_CACHE_PACK_MIN_TOKENS*n_expert_used) {
++            std::vector<int32_t> & pk = packed[il];
++            pk.resize(ne);
++            for (int64_t e = 0; e < ne; ++e) {
++                GGML_ASSERT(e < (1 << LLAMA_MOE_CACHE_PACK_SHIFT));
++                pk[e] = sm[e] >= 0 ? (int32_t) (e | ((int64_t) sm[e] << LLAMA_MOE_CACHE_PACK_SHIFT)) : 0;
++            }
++            put_slot_map(pk.data(), ne*sizeof(int32_t));
++        } else {
++            put_slot_map(sm, ne*sizeof(int32_t));
++        }
+ 
+-        return true;
++        const bool small = ids.size() <= (size_t) 8*n_expert_used;
++        if (small) {
++            layer_miss_small[il] += fills.size();
++        }
++        const int64_t t_cb = moe_now_ns() - t_cb0;
++        timing & tm = small ? tm_small : tm_large;
++        tm.wait_ns += t_wait;
++        tm.io_ns   += t_io;
++        tm.cb_ns   += t_cb;
++        tm.n_cb++;
++        tm.n_cb_miss += fills.empty() ? 0 : 1;
++        if (il == first_layer) {
++            ub.n_ids = (int64_t) ids.size();
++        }
++        ub.hits += n_hit;
++        ub.misses += fills.size();
++        ub.bytes += bytes;
++        ub.n_cb_miss += fills.empty() ? 0 : 1;
++        ub.wait_ns += t_wait;
++        ub.io_ns += t_io;
++        ub.cb_ns += t_cb;
+     }
+ 
+     void log_stats() const {
+@@ -593,6 +1103,18 @@ struct llama_moe_cache::impl {
+         };
+         log("ubatch <= 8", stats_small);
+         log("ubatch  > 8", stats_large);
++        auto logt = [](const char * name, const timing & tm) {
++            if (tm.n_cb == 0) {
++                return;
++            }
++            LLAMA_LOG_INFO("llama_moe_cache: %s: callbacks = %zu (%zu with misses), wait = %.1f ms, io = %.1f ms, callback total = %.1f ms\n",
++                name, tm.n_cb, tm.n_cb_miss, tm.wait_ns/1e6, tm.io_ns/1e6, tm.cb_ns/1e6);
++        };
++        logt("ubatch <= 8", tm_small);
++        logt("ubatch  > 8", tm_large);
++        if (async) {
++            LLAMA_LOG_INFO("llama_moe_cache: async: GPU held by the resolver %.1f ms (ubatch <= 8), %.1f ms (ubatch > 8)\n", stall_ns_small/1e6, stall_ns_large/1e6);
++        }
+         if (stats_copy.hits > 0) {
+             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+         }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 3b6726b..edf5ea1 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -8,6 +8,10 @@
+ 
+ struct llama_model;
+ 
++// (tq expert cache) ubatches of at least this many tokens get packed ids (expert | slot << shift) for the Metal mat-mat path
++#define LLAMA_MOE_CACHE_PACK_MIN_TOKENS 32
++#define LLAMA_MOE_CACHE_PACK_SHIFT      10
++
+ // keeps the most recently used experts of host-resident MoE layers in a device buffer
+ // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
+ class llama_moe_cache {
