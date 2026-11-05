@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Wai Chung
+# Qwen3.8-Flash-Next TR models on vLLM 0.32.0: the release configuration = TR2.57-G + tritq125 plugin (fused MoE, in-kernel split-K
+# reduce, 8-bit hyper-connections, skinny-GEMM plan fill, n-gram page read-ahead, v2 kernels, FP8 MTP draft head, all-language sparse
+# draft head) + vLLM PR #60068 (confidence-stop draft depth).
+# Build context: runtime/  ->  docker build -f docker/Dockerfile.qwen38-vllm032 -t tritq-qwen38:0.3 .
+# 0.3 (2026-10-27) carries the current defaults; a tritq-qwen38:0.2 image carries the old plugin source (English-and-code head,
+# BF16 draft head, no v2 kernels) and should not be used.
+#
+# The tritq-qwen38:0.3 image (the one the accuracy results were measured on) was built from this file (plugin comments and
+# docstrings have been edited since, so a rebuild is not byte-identical). The speed results
+# used an earlier image assembled by hand from the same recipe: vllm/vllm-openai:v0.28.0 (torch 2.13 + cu130, native sm_121)
+# + the vLLM 0.32.0 aarch64 wheel + transformers 5.19.0 + flash-linear-attention 0.5.2, then flashinfer-cubin and flashinfer-jit-cache
+# 0.7.0.post1 to match flashinfer-python (vLLM refused to start otherwise), then the #60068 patch below.
+# Not yet pinned: only the packages named below are pinned (not the full dependency set), and this file has not yet been rebuilt
+# on a clean machine.
+ARG BASE=vllm/vllm-openai:v0.28.0
+FROM ${BASE}
+RUN pip install --no-cache-dir "vllm==0.32.0" "transformers==5.19.0" "flash-linear-attention==0.5.2" \
+ && pip install --no-cache-dir --no-deps "flashinfer-cubin==0.7.0.post1" --extra-index-url https://flashinfer.ai/whl/ \
+ && pip install --no-cache-dir --no-deps "flashinfer-jit-cache==0.7.0.post1+cu130" --extra-index-url https://flashinfer.ai/whl/cu130 \
+ && apt-get update && apt-get install -y --no-install-recommends gcc patch && rm -rf /var/lib/apt/lists/*
+COPY vllm/tritq-qwen38 /opt/tritq-qwen38
+# vLLM PR #60068 "Confidence stop for autoregressive drafting" by @stecasta (Apache-2.0), the copy shipped in
+# salient-data/qwen38-next-dgx-recipe @f309019 (recipe/patches/0010-..., ported there at PR head 029a811e; Copyright 2026 Salient Data,
+# Apache-2.0). Applied unchanged with patch --fuzz=0. The patch file, with its provenance header, STAYS in the image at
+# /opt/tritq-qwen38/patches/; the list of vLLM files it modified is written next to it (Apache-2.0 section 4(b)).
+RUN set -e; P=/opt/tritq-qwen38/patches/0010-vllm60068-confidence-stop-for-autoregressive-drafting.patch; \
+    SP=$(python3 -c "import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))"); cd "$SP"; \
+    patch -p1 --fuzz=0 --no-backup-if-mismatch < "$P"; \
+    grep -E '^\+\+\+ b/.*\.py$' "$P" | sed 's#^+++ b/##' > /opt/tritq-qwen38/patches/MODIFIED_VLLM_FILES.txt; \
+    for f in $(cat /opt/tritq-qwen38/patches/MODIFIED_VLLM_FILES.txt); do python3 -m py_compile "$f"; done; \
+    sha256sum "$P" > /opt/tritq-qwen38/patches/APPLIED.sha256; \
+    pip install --no-deps --no-build-isolation /opt/tritq-qwen38; \
+    python3 -c "import vllm, importlib.metadata as m; print(vllm.__version__, [e.name for e in m.entry_points(group='vllm.general_plugins')])"
+# Plugin defaults (tritq125/__init__.py): fused MoE, in-kernel split-K reduce, 8-bit hyper-connections, skinny-GEMM plan fill,
+# n-gram read-ahead, v2 kernels (-e TRITQ_KERNELS_V2=0 off), FP8 MTP draft head (-e TRITQ_MTP_FP8=0 = BF16 head), draft head = sparse,
+# all languages (-e TRITQ_DRAFT_HEAD=english for the first 100,000 rows, =full for the full head). The FP8 and sparse draft heads change
+# the served text through the confidence stop (accuracy: no significant difference); --moe-backend triton drives the FP8 draft experts.
+# The confidence stop is switched on per server by --speculative-config (see the README quick start); without
+# draft_confidence_threshold the patch is inert (measured: greedy output identical to the unpatched image at k = 3).
+ENTRYPOINT ["vllm", "serve"]

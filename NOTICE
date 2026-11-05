@@ -15,6 +15,8 @@ vLLM project, licensed under the Apache License, Version 2.0:
     salient-data/qwen38-next-dgx-recipe (https://github.com/salient-data/qwen38-next-dgx-recipe), commit f309019,
     recipe/patches/0010-vllm60068-confidence-stop-for-autoregressive-drafting.patch (ported there at PR head 029a811e).
     Each modified file keeps the vLLM SPDX and copyright lines and carries a change notice.
+  - tritq-qwen38/patches/0010-vllm60068-confidence-stop-for-autoregressive-drafting.patch is that recipe patch,
+    unchanged (its provenance header is kept); the Docker image applies it to vLLM 0.32.0 and keeps it in the image.
 
   qwen38-next-dgx-recipe
   Copyright 2026 Salient Data
@@ -23,6 +25,11 @@ vLLM project, licensed under the Apache License, Version 2.0:
   Copyright the vLLM project contributors). Each patch states the vLLM base commit it applies to and the
   upstream pull request it ports, with its author; recipe/patches/PROVENANCE.md lists them. The vLLM
   copyright and SPDX lines in the modified files are unchanged.
+
+Derived from salient-data/qwen38-next-dgx-recipe (Copyright 2026 Salient Data, Apache-2.0):
+  - The skinny-GEMM plan fill in tritq125/vllm_plugin.py (function _patch_skinny_fill, option TRITQ_SKINNY_FILL)
+    follows recipe/patches/0011-skinny-gemm-rows.patch ("written for this recipe", commit f309019): the same fill
+    rule, applied at run time to every capability table instead of editing vLLM's SM121 table in place.
 
 Reimplemented from a published algorithm (no lines copied):
   - The sparse context-aware draft head (tritq/sparse.py, option TRITQ_DRAFT_HEAD=sparse) reimplements, for the
@@ -35,6 +42,8 @@ Ideas credited (no code was copied from these sources; each feature is an indepe
     FR-Spec (arXiv 2502.14856), VocabTrim (arXiv 2506.22694), community serving recipes for these models, and the
     --mtp-vocab option of the Atlas inference engine (idea only; no Atlas code was copied or adapted; independent
     implementation in Triton).
+  - Disk-backed n-gram (PLE) embedding table read through the operating system's page cache: the approach used by
+    vLLM's own Qwen3.8 pinned-host n-gram embedding and by community serving recipes (e.g. vllm#54129, vllm#58815).
 
 See PROVENANCE.md for the file-by-file origin and THIRD_PARTY_NOTICES.md for the third-party terms.
 

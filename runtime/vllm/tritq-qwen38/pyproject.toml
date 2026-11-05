@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tritq-qwen38"
+version = "0.3.0"
+description = "TR Quantisation: vLLM plugin with the packed k-trit ('trit') quantization method, hot/cold experts and a disk-backed n-gram table for Qwen3.8-Flash-Next TR models"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Wai Chung" }]
+requires-python = ">=3.10"
+# vLLM 0.32.0, torch and triton come from the serving image (see ../docker/Dockerfile.qwen38-vllm032). Install with --no-deps there.
+dependencies = ["numpy"]
+classifiers = ["License :: OSI Approved :: Apache Software License", "Programming Language :: Python :: 3"]
+
+[project.optional-dependencies]
+vllm = ["vllm==0.32.0"]
+
+# Do NOT install together with tritq-qwen36 in one environment: both register quant_method "trit".
+[project.entry-points."vllm.general_plugins"]
+tritq125 = "tritq125.vllm_plugin:register"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+packages = ["tritq125"]
+
+[tool.setuptools.package-data]
+# ngpf.c is compiled on first use (gcc, into ~/.cache/tritq125/) for the n-gram page read-ahead
+tritq125 = ["ngpf.c"]
