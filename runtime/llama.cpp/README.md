@@ -12,6 +12,16 @@ patches.
 | `0004` llama: SSD-backed MoE expert cache | experts stay in the GGUF file; a fixed cache of slots in GPU-visible memory; misses read from the SSD; output numerically equivalent to the normal path (float-level differences, not byte-identical; measured on the 35B, public series); 16 GB-mode accuracy GSM8K 94.0 / HumanEval 92.1 / MBPP 87.6 vs normal path 95.0 / 92.7 / 87.2, no significant difference (exact McNemar); answer wording differs from the normal path on about a quarter of items, while correctness changes on a few | off; `LLAMA_MOE_SSD=1` |
 | `0005` ggml-cpu: repacked kernels for the dense trit types | aarch64 CPU only: the TQ weights (including MoE experts) are repacked at load into a 4-row layout and run on NEON dotprod mat-vec / mat-mat kernels, with i8mm and SME2 mat-mat paths where the CPU has them; numerically equivalent to the 0001 CPU reference (float-level differences, not byte-identical); the repacked weights take more memory than the file (TQ9 +22 %, TQ27 +2.5 %, TQ81 +23 %) | on for aarch64; opt-out `GGML_TQ_NO_REPACK=1`, experts only `GGML_TQ_NO_MOE_REPACK=1`, per type `GGML_TQ_REPACK_MASK`, `GGML_TQ_NO_I8MM=1`, `GGML_TQ_NO_SME=1`, `GGML_TQ_SME_THREADS=n` (default 1) |
 
+## Ready-built binaries
+
+No build needed: the [`llama.cpp-tr-b11721` release](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721) has this series
+(0001-0005 on `ff5a233`) built for **macOS arm64** (Apple silicon, macOS 13.3+, Metal; CPU code for M1 / M2-M3 / M4+ picked at run time)
+and **Linux arm64** (glibc 2.39+, e.g. Ubuntu 24.04 / DGX OS; CPU only; CPU code for armv8.0 ... armv9.2 + SME picked at run time).
+Each archive has `llama-server` (with the web UI), `llama-cli`, `llama-completion`, `llama-bench`, `llama-perplexity` and `test-backend-ops`.
+The run lines below work with them as they are (`./llama-server` in the unpacked folder instead of `./build/bin/llama-server`).
+On macOS, an archive downloaded with a web browser needs `xattr -dr com.apple.quarantine <folder>` once. The archives are made by
+[`release/`](release/) (`build_macos_arm64.sh`, `build_linux_arm64.sh`); `--version` shows a local commit made by `apply.sh`, not an upstream one.
+
 ## Build
 
 ```bash

@@ -1,0 +1,14 @@
+llama.cpp with the TR Quantisation dense trit types - ready-built binaries
+
+Built from ggml-org/llama.cpp commit ff5a23376725e5a889fa0bfb987b7541dc304da0 (MIT, Copyright (c) 2023-2026 The ggml authors; LICENSE)
+with patches 0001-0005 from github.com/ternii-ai/tritq-vllm, runtime/llama.cpp (MIT, Copyright 2026 Wai Chung; LICENSE-TR),
+applied by that folder's apply.sh.
+
+Statically linked or embedded third-party components:
+- BoringSSL (HTTPS for -hf model downloads), Apache License 2.0: LICENSE-boringssl
+- cpp-httplib, MIT: LICENSE-httplib
+- nlohmann/json, MIT: LICENSE-jsonhpp
+- llama.cpp web UI (ggml-org/llama-ui, release b11721), MIT, The ggml authors: LICENSE
+
+Qwen is a trademark of Alibaba Cloud; Mac and Metal are trademarks of Apple Inc.; Arm is a trademark of Arm Limited.
+No affiliation or endorsement is implied.
