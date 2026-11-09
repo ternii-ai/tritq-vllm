@@ -12,7 +12,7 @@ The script reports how many tensors are reproduced exactly and the largest error
 check the result with llama-perplexity --kl-divergence against the F16 file.
 
 usage: python3 ternary_gguf_to_tq9.py <llama.cpp-tr>/gguf-py F16.gguf LIKE.gguf OUT.gguf
-  (gguf-py from the patched tree made by ../apply.sh; it carries the TQ9_128 packer)"""
+  (gguf-py from the patched tree made by ../apply.sh; it carries the TQ9_128 packer; needs numpy and PyYAML)"""
 import sys
 import numpy as np
 

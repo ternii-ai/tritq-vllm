@@ -28,7 +28,7 @@ On macOS, an archive downloaded with a web browser needs `xattr -dr com.apple.qu
 [`tools/ternary_gguf_to_tq9.py`](tools/ternary_gguf_to_tq9.py) re-packs a model that was trained ternary (weights already -1 / 0 / +1 times a
 scale, e.g. PrismML's Ternary Bonsai) into TQ9_128, so it runs on the 0005 / 0006 aarch64 CPU kernels. It needs the model's F16 GGUF and a
 ternary GGUF of it (Q2_0, TQ1_0 or TQ2_0 tensors mark which weights to re-pack; everything else is copied), and the `gguf-py` of a tree made by
-`apply.sh`. TQ9_128 takes 3.375 bits per weight, so the file is larger than a 2-bit ternary GGUF.
+`apply.sh` (Python 3 with numpy and PyYAML; Ubuntu 22.04's `python3-numpy python3-yaml` work). TQ9_128 takes 3.375 bits per weight, so the file is larger than a 2-bit ternary GGUF.
 
 Ternary Bonsai 1.7B, one machine (DGX Spark, 4 Cortex-A725 cores, each build limited to the dotprod + fp16 CPU code a Neoverse-N1 runs;
 `llama-bench` tg128 at 4 threads / pp512, two passes; KL divergence vs the F16 file on WikiText-2, 20 × 512 tokens):
