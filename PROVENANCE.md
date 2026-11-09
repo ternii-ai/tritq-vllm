@@ -23,7 +23,7 @@ Updated 2026-11-05 (Qwen3.6-35B-A3B and Qwen3.8-Flash-Next). "Ours" = written fo
 | | `__init__.py` | ours | release defaults and public option names |
 | tritq-qwen38/patches | `0010-vllm60068-confidence-stop-for-autoregressive-drafting.patch` | salient-data recipe @f309019, unchanged (md5 e9631fa9a9f2fccf78be0306d276331d) | vllm#60068 by @stecasta, ported at PR head 029a811e (PR later at 8ae78cca); applied to vLLM 0.32.0 by the Dockerfile |
 | docker | `Dockerfile.qwen36-vllm028`, `Dockerfile.qwen38-vllm032` | ours | |
-| llama.cpp | `patches/0001`-`0005`, `apply.sh` | ours (MIT) | patch series on ggml-org/llama.cpp @ff5a233 |
+| llama.cpp | `patches/0001`-`0006`, `apply.sh`, `tools/` | ours (MIT) | patch series on ggml-org/llama.cpp @ff5a233 |
 | bench | `bench_oai.py` | ours | engine-neutral OpenAI-API decode benchmark |
 
 Third-party benchmark harness: `bench/run_community_harness.sh` downloads `tools/bench_categories.py` from

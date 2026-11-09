@@ -8,7 +8,7 @@ Quantisation"). They need a small runtime addition:
 | `vllm/tritq-qwen36` | Qwen3.6-35B-A3B TR checkpoints on **vLLM 0.28.0** | pip package (vLLM plugin entry point `tritq`) + `vllm028_overlay/` (confidence-stop draft depth, 7 vLLM 0.28.0 files) |
 | `vllm/tritq-qwen38` | Qwen3.8-Flash-Next TR checkpoints on **vLLM 0.32.0** | pip package (entry point `tritq125`) + `patches/` (vLLM PR #60068, applied by the Dockerfile) |
 | `docker/` | one image per model family (DGX Spark, aarch64, CUDA 13) | Dockerfiles; base images are not fetched here |
-| `llama.cpp/` | GGUF files on Macs (Metal); aarch64 CPU kernels (patch 0005) | patch series on ggml-org/llama.cpp @ff5a233 + build notes |
+| `llama.cpp/` | GGUF files on Macs (Metal); aarch64 CPU kernels (patches 0005-0006); tools/ for trained ternary models | patch series on ggml-org/llama.cpp @ff5a233 + build notes |
 | `bench/` | speed measurement | our OpenAI-API client + a pinned wrapper for the community harness |
 
 **Version split.** The Qwen3.6-35B-A3B runtime was measured on vLLM 0.28.0; the Qwen3.8-Flash-Next runtime needs vLLM 0.32.0 (the first

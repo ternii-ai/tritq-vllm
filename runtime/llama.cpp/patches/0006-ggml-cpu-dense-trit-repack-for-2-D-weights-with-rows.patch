@@ -1,0 +1,120 @@
+From ee17fe814d0e9511af04949b7031fd968e15982a Mon Sep 17 00:00:00 2001
+From: Wai Chung <hello@ternii.com>
+Date: Mon, 9 Nov 2026 22:40:25 +0000
+Subject: [PATCH] ggml-cpu: dense trit repack for 2-D weights with rows not a
+ multiple of 4
+
+The repacked TQ9/TQ27/TQ81 kernels take 4 rows at a time and refused any
+tensor whose row count is not a multiple of 4. Such a tensor stayed on the
+scalar reference path: with a 151,669-token vocabulary (e.g. PrismML's
+Ternary Bonsai 1.7B, a Qwen3 derivative) that is the output layer, run on
+every generated token.
+
+2-D weights are now repacked with the last group of 4 padded with zero rows
+(the buffer is sized for the padded rows); the chunk routine computes that
+group into a per-thread scratch buffer and writes back only the real rows.
+MoE (3-D) weights still require a multiple of 4.
+
+Ternary Bonsai 1.7B in TQ9_128, CPU variant armv8.2_2 (dotprod + fp16, the
+one a Neoverse-N1 loads), 4 Cortex-A725 cores: tg128 16.4 -> 41.8 tok/s at
+4 threads, 4.3 -> 11.6 at 1 thread; pp512 56.3 -> 57.2. Tensors with
+rows % 4 == 0 are unchanged (WikiText-2 KLD vs the unpatched build 0.000000,
+the same maximum as the unpatched build against itself).
+---
+ ggml/src/ggml-cpu/repack.cpp | 42 +++++++++++++++++++++++++++---------
+ 1 file changed, 32 insertions(+), 10 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index 350dbb583..f7ff19bda 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -4323,12 +4323,16 @@ static int repack_tq_to_rx4(struct ggml_tensor * t, const void * GGML_RESTRICT d
+     const int nrow    = ggml_nrows(t);
+     const int nblocks = t->ne[0] / QK_TQD;
+     GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(BT));
+-    if (t->ne[1] % 4 != 0 || t->ne[0] % QK_K != 0) return -1;
++    // 2-D weights with rows % 4 != 0 (e.g. a 151,669-row output layer): the last group is padded with zero rows
++    if ((t->ne[1] % 4 != 0 && t->ne[2] != 1) || t->ne[0] % QK_K != 0) return -1;
+     RTX4 * dst = (RTX4 *) t->data;
+     const BT * src = (const BT *) data;
+     for (int b = 0; b < nrow; b += 4) {
+         for (int x = 0; x < nblocks; x++) {
+-            for (int i = 0; i < 4; i++) dst->b[i] = MAKE(src + (size_t) (b + i)*nblocks + x);
++            for (int i = 0; i < 4; i++) {
++                if (b + i < nrow) dst->b[i] = MAKE(src + (size_t) (b + i)*nblocks + x);
++                else              memset(&dst->b[i], 0, sizeof(dst->b[i]));
++            }
+             dst++;
+         }
+     }
+@@ -4340,12 +4344,15 @@ static int repack_tq27_to_r27x4(struct ggml_tensor * t, const void * GGML_RESTRI
+     const int nrow    = ggml_nrows(t);
+     const int nblocks = t->ne[0] / QK_TQD;
+     GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_tq27_128));
+-    if (t->ne[1] % 4 != 0 || t->ne[0] % QK_K != 0) return -1;
++    if ((t->ne[1] % 4 != 0 && t->ne[2] != 1) || t->ne[0] % QK_K != 0) return -1;
+     block_r27x4 * dst = (block_r27x4 *) t->data;
+     const block_tq27_128 * src = (const block_tq27_128 *) data;
+     for (int b = 0; b < nrow; b += 4) {
+         for (int x = 0; x < nblocks; x++) {
+-            for (int i = 0; i < 4; i++) dst->b[i] = make_block_r27(src + (size_t) (b + i)*nblocks + x);
++            for (int i = 0; i < 4; i++) {
++                if (b + i < nrow) dst->b[i] = make_block_r27(src + (size_t) (b + i)*nblocks + x);
++                else              memset(&dst->b[i], 0, sizeof(dst->b[i]));
++            }
+             dst++;
+         }
+     }
+@@ -5570,10 +5577,23 @@ template <> void tensor_traits<block_##TQ, 3, 4, GGML_TYPE_Q8_0>::forward_mul_ma
+     const int64_t nrows = src1_end - src1_start; \
+     const int64_t ncols = src0_end - src0_start; \
+     GGML_ASSERT(src1_ptr + src1_col_stride * nrows <= (const char *) params->wdata + params->wsize); \
+-    GGML_ASSERT(src0_start % 4 == 0 && ncols % 4 == 0); \
++    GGML_ASSERT(src0_start % 4 == 0 && (ncols % 4 == 0 || src0_end == ne01)); \
+  \
+     TQS_MARK(params->ith); \
+-    ggml_mul_##R##_q8_0(ne00, (float *) dst_ptr + src0_start, nb1 / nb0, src0_ptr + src0_start * row_r27, src1_ptr, nrows, ncols); \
++    const int64_t nfull = ncols & ~(int64_t) 3; \
++    if (nfull > 0) { \
++        ggml_mul_##R##_q8_0(ne00, (float *) dst_ptr + src0_start, nb1 / nb0, src0_ptr + src0_start * row_r27, src1_ptr, nrows, nfull); \
++    } \
++    if (ncols > nfull) { /* last group of a tensor with rows % 4 != 0: computed with its zero pad rows, real rows copied out */ \
++        static thread_local std::vector<float> tail; \
++        tail.resize((size_t) nrows * 4); \
++        ggml_mul_##R##_q8_0(ne00, tail.data(), 4, src0_ptr + (src0_start + nfull) * row_r27, src1_ptr, nrows, 4); \
++        for (int64_t r = 0; r < nrows; r++) { \
++            for (int64_t c = 0; c < ncols - nfull; c++) { \
++                ((float *) (dst_ptr + r * nb1))[src0_start + nfull + c] = tail[(size_t) r * 4 + c]; \
++            } \
++        } \
++    } \
+ }
+ TQD_CHUNK_SPEC(tq27_128, r27)
+ TQD_CHUNK_SPEC(tq9_128, r9)
+@@ -5914,7 +5934,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
+         // GGML_TQ_NO_MOE_REPACK=1 keeps 3-D (MoE expert) weights on the reference path.
+         static const bool moe_off = [] { const char * e = getenv("GGML_TQ_NO_MOE_REPACK"); return e && atoi(e) != 0; }();
+         const int bit = cur->type == GGML_TYPE_TQ9_128 ? 1 : cur->type == GGML_TYPE_TQ27_128 ? 2 : 4;
+-        if (!off && (mask & bit) && cur->ne[0] % QK_K == 0 && cur->ne[1] % 4 == 0 && cur->ne[3] == 1 && (cur->ne[2] == 1 || !moe_off)) {
++        if (!off && (mask & bit) && cur->ne[0] % QK_K == 0 && (cur->ne[1] % 4 == 0 || cur->ne[2] == 1) && cur->ne[3] == 1 && (cur->ne[2] == 1 || !moe_off)) {
+             return cur->type == GGML_TYPE_TQ27_128 ? (const ggml::cpu::tensor_traits *) &tq27_r27_q8_0
+                  : cur->type == GGML_TYPE_TQ9_128  ? (const ggml::cpu::tensor_traits *) &tq9_r9_q8_0
+                  :                                   (const ggml::cpu::tensor_traits *) &tq81_r81_q8_0;
+@@ -6022,9 +6042,11 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
+ 
+ static size_t ggml_backend_cpu_repack_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+     if (ggml_repack_get_optimal_repack_type(tensor) != nullptr) {
+-        if (tensor->type == GGML_TYPE_TQ27_128) return ggml_nbytes(tensor) / sizeof(block_tq27_128) * sizeof(block_r27);
+-        if (tensor->type == GGML_TYPE_TQ9_128)  return ggml_nbytes(tensor) / sizeof(block_tq9_128)  * sizeof(block_r9);
+-        if (tensor->type == GGML_TYPE_TQ81_128) return ggml_nbytes(tensor) / sizeof(block_tq81_128) * sizeof(block_r81);
++        // rows padded to a multiple of 4 (2-D weights may have rows % 4 != 0, see repack_tq_to_rx4)
++        const size_t nblk = (size_t) (tensor->ne[0] / QK_TQD) * GGML_PAD(tensor->ne[1], 4) * tensor->ne[2] * tensor->ne[3];
++        if (tensor->type == GGML_TYPE_TQ27_128) return nblk * sizeof(block_r27);
++        if (tensor->type == GGML_TYPE_TQ9_128)  return nblk * sizeof(block_r9);
++        if (tensor->type == GGML_TYPE_TQ81_128) return nblk * sizeof(block_r81);
+     }
+     return ggml_nbytes(tensor);
+     GGML_UNUSED(buft);
+-- 
+2.54.0 (Apple Git-157)
+

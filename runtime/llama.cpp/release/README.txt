@@ -1,6 +1,6 @@
 llama.cpp with the TR Quantisation dense trit types (TQ9_128 / TQ27_128 / TQ81_128)
 
-Ready-built binaries of upstream llama.cpp ff5a233 + patches 0001-0005 from
+Ready-built binaries of upstream llama.cpp ff5a233 + patches 0001-0006 from
 github.com/ternii-ai/tritq-vllm (runtime/llama.cpp). They load the GGUF files of the TR models
 (e.g. huggingface.co/Ternii/Qwen3.6-35B-A3B-TR2.25-G-GGUF), which stock llama.cpp, Ollama and LM Studio cannot.
 

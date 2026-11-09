@@ -1,7 +1,7 @@
 llama.cpp with the TR Quantisation dense trit types - ready-built binaries
 
 Built from ggml-org/llama.cpp commit ff5a23376725e5a889fa0bfb987b7541dc304da0 (MIT, Copyright (c) 2023-2026 The ggml authors; LICENSE)
-with patches 0001-0005 from github.com/ternii-ai/tritq-vllm, runtime/llama.cpp (MIT, Copyright 2026 Wai Chung; LICENSE-TR),
+with patches 0001-0006 from github.com/ternii-ai/tritq-vllm, runtime/llama.cpp (MIT, Copyright 2026 Wai Chung; LICENSE-TR),
 applied by that folder's apply.sh.
 
 Statically linked or embedded third-party components:

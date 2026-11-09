@@ -11,16 +11,36 @@ patches.
 | `0003` ggml-metal: decode fusions for Qwen3.8-Flash-Next | GDN input prep folded into the GDN kernel; norm x gate in one dispatch | off; `GGML_METAL_OPT_GDNPREP=1 GGML_METAL_OPT_NGATED=1` |
 | `0004` llama: SSD-backed MoE expert cache | experts stay in the GGUF file; a fixed cache of slots in GPU-visible memory; misses read from the SSD; output numerically equivalent to the normal path (float-level differences, not byte-identical; measured on the 35B, public series); 16 GB-mode accuracy GSM8K 94.0 / HumanEval 92.1 / MBPP 87.6 vs normal path 95.0 / 92.7 / 87.2, no significant difference (exact McNemar); answer wording differs from the normal path on about a quarter of items, while correctness changes on a few | off; `LLAMA_MOE_SSD=1` |
 | `0005` ggml-cpu: repacked kernels for the dense trit types | aarch64 CPU only: the TQ weights (including MoE experts) are repacked at load into a 4-row layout and run on NEON dotprod mat-vec / mat-mat kernels, with i8mm and SME2 mat-mat paths where the CPU has them; numerically equivalent to the 0001 CPU reference (float-level differences, not byte-identical); the repacked weights take more memory than the file (TQ9 +22 %, TQ27 +2.5 %, TQ81 +23 %) | on for aarch64; opt-out `GGML_TQ_NO_REPACK=1`, experts only `GGML_TQ_NO_MOE_REPACK=1`, per type `GGML_TQ_REPACK_MASK`, `GGML_TQ_NO_I8MM=1`, `GGML_TQ_NO_SME=1`, `GGML_TQ_SME_THREADS=n` (default 1) |
+| `0006` ggml-cpu: repack 2-D weights with rows not a multiple of 4 | 0005 refused such tensors and left them on the 0001 scalar reference; they are now repacked with the last group of 4 padded with zero rows and only the real rows written back (MoE 3-D weights still need a multiple of 4). Matters for vocabularies like Qwen3's 151,669 tokens (e.g. Ternary Bonsai 1.7B re-packed with [`tools/`](tools/)), whose output layer runs on every generated token: there, decode ×2.7 on a Neoverse-N1-class CPU path; tensors with rows % 4 == 0 unchanged | on with 0005 |
 
 ## Ready-built binaries
 
-No build needed: the [`llama.cpp-tr-b11721` release](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721) has this series
-(0001-0005 on `ff5a233`) built for **macOS arm64** (Apple silicon, macOS 13.3+, Metal; CPU code for M1 / M2-M3 / M4+ picked at run time)
+No build needed: the [`llama.cpp-tr-b11721-r2` release](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r2) has this series
+(0001-0006 on `ff5a233`; the earlier `llama.cpp-tr-b11721` release has 0001-0005) built for **macOS arm64** (Apple silicon, macOS 13.3+, Metal; CPU code for M1 / M2-M3 / M4+ picked at run time)
 and **Linux arm64** (glibc 2.39+, e.g. Ubuntu 24.04 / DGX OS; CPU only; CPU code for armv8.0 ... armv9.2 + SME picked at run time).
 Each archive has `llama-server` (with the web UI), `llama-cli`, `llama-completion`, `llama-bench`, `llama-perplexity` and `test-backend-ops`.
 The run lines below work with them as they are (`./llama-server` in the unpacked folder instead of `./build/bin/llama-server`).
 On macOS, an archive downloaded with a web browser needs `xattr -dr com.apple.quarantine <folder>` once. The archives are made by
 [`release/`](release/) (`build_macos_arm64.sh`, `build_linux_arm64.sh`); `--version` shows a local commit made by `apply.sh`, not an upstream one.
+
+## Trained ternary models (`tools/`)
+
+[`tools/ternary_gguf_to_tq9.py`](tools/ternary_gguf_to_tq9.py) re-packs a model that was trained ternary (weights already -1 / 0 / +1 times a
+scale, e.g. PrismML's Ternary Bonsai) into TQ9_128, so it runs on the 0005 / 0006 aarch64 CPU kernels. It needs the model's F16 GGUF and a
+ternary GGUF of it (Q2_0, TQ1_0 or TQ2_0 tensors mark which weights to re-pack; everything else is copied), and the `gguf-py` of a tree made by
+`apply.sh`. TQ9_128 takes 3.375 bits per weight, so the file is larger than a 2-bit ternary GGUF.
+
+Ternary Bonsai 1.7B, one machine (DGX Spark, 4 Cortex-A725 cores, each build limited to the dotprod + fp16 CPU code a Neoverse-N1 runs;
+`llama-bench` tg128 at 4 threads / pp512, two passes; KL divergence vs the F16 file on WikiText-2, 20 × 512 tokens):
+
+| file | build | size | tok/s generate / prompt | KLD |
+|---|---|---|---|---|
+| `Q2_0_g64` (PrismML) | upstream llama.cpp 9f0e5098a | 0.49 GB | 21.7 / 27.8 | 0.0002 |
+| `PQ2_0` (PrismML) | PrismML's llama.cpp fork 6447906bf | 0.46 GB | 27.3 / 35.6 | 0.0010 |
+| TQ9_128 from this tool | this series, 0001-0006 | 0.73 GB | 41.8 / 57.2 | 0.0002 |
+
+One CPU type and one model; not measured on a real Neoverse-N1 (the A725 cores run upstream's files 18-46 % faster than published N1 figures,
+with the same ranking).
 
 ## Build
 

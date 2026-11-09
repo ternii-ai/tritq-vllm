@@ -1,7 +1,7 @@
 Patch series for llama.cpp adding dense trit types (TQ9_128 / TQ27_128 / TQ81_128), Metal kernels and an SSD-backed MoE expert cache.
 
 Base: ggml-org/llama.cpp commit ff5a23376725e5a889fa0bfb987b7541dc304da0 (MIT, Copyright (c) 2023-2026 The ggml authors), cloned
-unchanged by apply.sh; its LICENSE and licenses/ directory apply to the upstream code. Our patches (0001-0005), apply.sh and release/ scripts are
+unchanged by apply.sh; its LICENSE and licenses/ directory apply to the upstream code. Our patches (0001-0006), apply.sh, release/ scripts and tools/ are
 Copyright 2026 Wai Chung and are licensed under the MIT License (LICENSE in this folder), the same terms as upstream.
 
 Qwen, NVIDIA, CUDA, Mac and Metal: see ../../TRADEMARKS.md.
