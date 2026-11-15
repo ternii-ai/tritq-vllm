@@ -52,6 +52,13 @@ nominally ahead on HumanEval+, MBPP+ base and IFEval. Against Qwen's own FP8 rel
 HumanEval+ and MBPP+. "No significant difference" is not a claim of equality: a 2-3 point
 gap on HumanEval+ or LiveCodeBench would not have been detectable.
 
+**On a 16 GB Mac:** `Ternii/Qwen3.8-Flash-Next-TR2.31-G-GGUF` (routed experts at 2 trits, the rest at 3; experts streamed from the SSD)
+runs at about 12 tokens/s on a MacBook Air M5 with 16 GB. One line in Terminal downloads everything and starts a local chat:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ternii-ai/tritq-vllm/main/mac/qwen38-16gb.sh | bash
+```
+
 The Mac file for this model (`Ternii/Qwen3.8-Flash-Next-TR3-G-GGUF`) is **experimental** and a different file (every translated weight
 at 3 trits); the comparisons above do not apply to it.
 
@@ -63,6 +70,7 @@ at 3 trits); the comparisons above do not apply to it.
 | [Ternii/Qwen3.6-35B-A3B-TR2.25-G-GGUF](https://huggingface.co/Ternii/Qwen3.6-35B-A3B-TR2.25-G-GGUF) | llama.cpp (Mac) |
 | [Ternii/Qwen3.8-Flash-Next-TR2.57-G](https://huggingface.co/Ternii/Qwen3.8-Flash-Next-TR2.57-G) | vLLM, `ghcr.io/ternii-ai/tritq-qwen38:0.3` |
 | [Ternii/Qwen3.8-Flash-Next-TR3-G-GGUF](https://huggingface.co/Ternii/Qwen3.8-Flash-Next-TR3-G-GGUF) | llama.cpp (Mac), experimental |
+| [Ternii/Qwen3.8-Flash-Next-TR2.31-G-GGUF](https://huggingface.co/Ternii/Qwen3.8-Flash-Next-TR2.31-G-GGUF) | llama.cpp (Mac), **16 GB Macs** (one-line setup: [`mac/qwen38-16gb.sh`](mac/qwen38-16gb.sh)) |
 
 ## Licence
 

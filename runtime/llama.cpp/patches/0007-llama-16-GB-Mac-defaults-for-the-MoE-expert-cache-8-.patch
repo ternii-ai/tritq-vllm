@@ -1,0 +1,1202 @@
+From ce1b3bece63901c2a3fa5049bd6d8bdbd1b79acb Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:05:58 +0000
+Subject: [PATCH] llama: 16 GB Mac defaults for the MoE expert cache (8
+ experts, read-ahead, learned predictor)
+
+On the SSD expert cache path (LLAMA_MOE_SSD=1) only:
+- Qwen4Exp uses 8 routed experts per token instead of the model's 10. LLAMA_MOE_EXPERTS=N picks
+  another supported count (1, 2, 4, 5, 6, 8, 9, 10; an unsupported value warns and keeps the
+  model's own), LLAMA_MOE_EXPERTS=0 keeps the model's own, and --override-kv always wins.
+- Next-layer read-ahead: the experts of layer L+1 are predicted during layer L and read from the
+  file while the GPU runs (LLAMA_MOE_PRED, LLAMA_MOE_PRED_K, default 6). A GPU keep-busy filler
+  stops the GPU clocking down while it waits for the SSD (GGML_METAL_MOE_SPIN=0 turns it off).
+- Learned predictor: <model>.trpw next to the model (first shard name without -0000N-of-0000M)
+  is loaded automatically and replaces the next layer's router for read-ahead only; it changes
+  which experts are read early, never the output. A missing or bad file falls back to the router
+  with a warning. LLAMA_MOE_PRED_W=<file> loads a given file (errors are fatal);
+  LLAMA_MOE_PRED_W= (empty) turns it off.
+- The cache size gives back the extra attention KV of windows above 4096
+  (LLAMA_MOE_CACHE_REF_CTX, 0 = off), so long windows stay within the GPU budget.
+- Metal MUL_MAT_ID map0 kernel for 9 experts; separate row/simdgroup counts for the trit
+  expert mat-vec.
+
+Fully resident models and other back ends are unchanged.
+---
+ ggml/src/ggml-metal/ggml-metal-context.m  | 276 ++++++++++++++++
+ ggml/src/ggml-metal/ggml-metal-device.cpp |   4 +-
+ ggml/src/ggml-metal/ggml-metal-device.h   |   5 +
+ ggml/src/ggml-metal/ggml-metal-device.m   |  46 +++
+ ggml/src/ggml-metal/ggml-metal-impl.h     |   8 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |  11 +
+ ggml/src/ggml-metal/ggml-metal-ops.h      |   4 +
+ ggml/src/ggml-metal/kernels/mul_mm.metal  |   1 +
+ ggml/src/ggml-metal/kernels/mul_mv.metal  |   6 +-
+ src/llama-context.cpp                     |  20 ++
+ src/llama-model.cpp                       |  25 ++
+ src/llama-model.h                         |   1 +
+ src/llama-moe-cache.cpp                   | 367 +++++++++++++++++++++-
+ src/llama-moe-cache.h                     |   9 +
+ src/llama.cpp                             |   1 +
+ src/models/qwen4exp.cpp                   |  20 ++
+ 16 files changed, 792 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 46007fcac..dec173e3e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -93,6 +93,179 @@
+ static uint64_t g_moe_done_last = 0; // value signalled at the end of the last encoded graph_compute
+ static uint64_t g_moe_go_last   = 0;
+ 
++// ---- (profiling) GGML_METAL_OPPROF=1: per command buffer GPU busy/idle in decode; =2: also per-op GPU time ----
++#include <os/lock.h>
++#include <mach/mach_time.h>
++#include <pthread.h>
++#include <unistd.h>
++#define PROF_RING   4096
++#define PROF_NSB    16
++#define PROF_SAMP   2048
++#define PROF_MAXL   160
++typedef struct { double commit, go_t, gs, ge; int decode, last, done, nsamp, sb; uint64_t go_v; int lab[PROF_SAMP/2]; } prof_rec_t;
++static int           g_prof = -1;
++static os_unfair_lock g_prof_lock = OS_UNFAIR_LOCK_INIT;
++static prof_rec_t    g_prof_rec[PROF_RING];
++static long          g_prof_seq = 0, g_prof_next = 0;
++static double        g_prof_go_t[PROF_RING];
++static double        g_prof_prev_ge = 0;
++static long          g_prof_tok = 0, g_prof_cbs = 0;
++static double        g_prof_opsum = 0;
++static double        g_prof_busy = 0, g_prof_busy_after_go = 0, g_prof_gap = 0, g_prof_gap_cpu = 0, g_prof_gap_go = 0, g_prof_gap_rest = 0, g_prof_inwait = 0, g_prof_wall = 0, g_prof_t0 = 0;
++static void *        g_prof_sb[PROF_NSB];
++static id<MTLCommandBuffer> g_prof_sb_cb[PROF_NSB];
++static int           g_prof_sb_i = 0;
++static char          g_prof_lab_name[PROF_MAXL][64];
++static double        g_prof_lab_us[PROF_MAXL];
++static long          g_prof_lab_cnt[PROF_MAXL];
++static int           g_prof_nlab = 0;
++static double prof_now(void) { // host time in seconds, the time base of GPUStartTime / GPUEndTime
++    static mach_timebase_info_data_t tb = {0, 0};
++    if (tb.denom == 0) mach_timebase_info(&tb);
++    return (double) mach_absolute_time() * tb.numer / tb.denom * 1e-9;
++}
++static int prof_mode(void) { if (g_prof < 0) { const char * v = getenv("GGML_METAL_OPPROF"); g_prof = v ? atoi(v) : 0; } return g_prof; }
++static int prof_label(const char * s) {
++    for (int i = 0; i < g_prof_nlab; ++i) if (strcmp(g_prof_lab_name[i], s) == 0) return i;
++    if (g_prof_nlab >= PROF_MAXL) return PROF_MAXL - 1;
++    snprintf(g_prof_lab_name[g_prof_nlab], 64, "%s", s);
++    return g_prof_nlab++;
++}
++static void prof_report(void) {
++    const double n = (double) g_prof_tok; if (n <= 0) return;
++    fprintf(stderr, "[opprof] mode %d tokens %ld cbs/token %.1f | per token ms: wall %.2f busy %.2f (after go %.2f, in go-wait %.2f) gaps %.2f = cpu-late %.2f + go-late %.2f + other %.2f\n",
++        g_prof, g_prof_tok, g_prof_cbs/n, 1e3*g_prof_wall/n, 1e3*g_prof_busy/n, 1e3*g_prof_busy_after_go/n, 1e3*g_prof_inwait/n, 1e3*g_prof_gap/n, 1e3*g_prof_gap_cpu/n, 1e3*g_prof_gap_go/n, 1e3*g_prof_gap_rest/n);
++    if (g_prof >= 2) {
++        int ord[PROF_MAXL]; for (int i = 0; i < g_prof_nlab; ++i) ord[i] = i;
++        for (int i = 0; i < g_prof_nlab; ++i) for (int j = i+1; j < g_prof_nlab; ++j) if (g_prof_lab_us[ord[j]] > g_prof_lab_us[ord[i]]) { int t = ord[i]; ord[i] = ord[j]; ord[j] = t; }
++        double tot = 0; for (int i = 0; i < g_prof_nlab; ++i) tot += g_prof_lab_us[i];
++        fprintf(stderr, "[opprof]   ops total %.2f ms/token (sampled cbs %.2f)\n", tot/n/1e3, g_prof_opsum/n/1e3);
++        for (int k = 0; k < g_prof_nlab; ++k) { const int i = ord[k];
++            fprintf(stderr, "[opprof]   %-44s %8.1f us/token  %6.1f /token  %6.2f us each\n", g_prof_lab_name[i], g_prof_lab_us[i]/n, g_prof_lab_cnt[i]/n, g_prof_lab_us[i]/(g_prof_lab_cnt[i] ? g_prof_lab_cnt[i] : 1)); }
++    }
++}
++static void prof_advance(void) { // under lock: consume completed records in submission order
++    while (g_prof_next < g_prof_seq && g_prof_rec[g_prof_next % PROF_RING].done) {
++        prof_rec_t * r = &g_prof_rec[g_prof_next % PROF_RING];
++        if (r->decode) {
++            const double gs = r->gs, ge = r->ge;
++            if (g_prof_t0 == 0) g_prof_t0 = gs;
++            g_prof_cbs++;
++            g_prof_busy += ge - gs;
++            const double go = r->go_v ? r->go_t : 0;
++            g_prof_busy_after_go += ge - (go > gs ? go : gs);
++            if (go > gs) g_prof_inwait += (go < ge ? go : ge) - gs;
++            if (g_prof_prev_ge > 0 && gs > g_prof_prev_ge && gs - g_prof_prev_ge < 1.0) {
++                const double gap = gs - g_prof_prev_ge;
++                double cpu = r->commit - g_prof_prev_ge; if (cpu < 0) cpu = 0; if (cpu > gap) cpu = gap;
++                const double base = g_prof_prev_ge > r->commit ? g_prof_prev_ge : r->commit;
++                double gol = go - base; if (gol < 0) gol = 0; if (gol > gap - cpu) gol = gap - cpu;
++                g_prof_gap += gap; g_prof_gap_cpu += cpu; g_prof_gap_go += gol; g_prof_gap_rest += gap - cpu - gol;
++            }
++            g_prof_prev_ge = ge;
++            if (r->last) {
++                g_prof_tok++;
++                g_prof_wall = ge - g_prof_t0;
++                if (g_prof_tok % 512 == 0) prof_report();
++            }
++        } else {
++            g_prof_prev_ge = 0; // prefill / other work: restart the gap chain
++        }
++        g_prof_next++;
++    }
++}
++// -----------------------------------------------------------------------------------------------
++
++// ---- GGML_METAL_MOE_SPIN=1: while the GPU waits for the expert cache's "go", it spins in a tiny kernel on a shared
++// flag instead of parking on the event, so the GPU does not clock down between layers. The event wait is still
++// encoded right after the spin, so ordering and memory visibility are exactly as without the spin.
++static int g_spin = -1;
++static id<MTLBuffer> g_spin_buf = nil;               // [0] = go value written by the host, [1] = iterations (debug)
++static id<MTLComputePipelineState> g_spin_pso = nil;
++// GGML_METAL_MOE_SPIN=2: a background thread keeps a second command queue busy with a tiny filler kernel while decode is
++// active (an expert-cache mark in the last 50 ms), so the GPU does not clock down while the main queue waits on the event.
++static volatile uint64_t g_fill_last = 0;
++static void * fill_thread(void * arg) {
++    id<MTLDevice> device = (id<MTLDevice>) arg;
++    NSString * src = @"#include <metal_stdlib>\n"
++        "using namespace metal;\n"
++        "kernel void moe_fill(device float * out [[buffer(0)]], constant uint & n [[buffer(1)]], uint tid [[thread_position_in_grid]]) {\n"
++        "    float a = (float) tid;\n"
++        "    for (uint i = 0; i < n; ++i) { a = fma(a, 1.0000001f, 0.5f); }\n"
++        "    out[tid & 63] = a;\n"
++        "}\n";
++    NSError * err = nil;
++    id<MTLLibrary> lib = [device newLibraryWithSource:src options:nil error:&err];
++    if (!lib) { GGML_ABORT("moe_fill: %s", [[err description] UTF8String]); }
++    id<MTLFunction> fn = [lib newFunctionWithName:@"moe_fill"];
++    id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:fn error:&err];
++    id<MTLCommandQueue> q = [device newCommandQueue];
++    id<MTLBuffer> buf = [device newBufferWithLength:256 options:MTLResourceStorageModeShared];
++    const char * ns = getenv("GGML_METAL_MOE_FILL_N");
++    const uint32_t n = ns ? (uint32_t) atoi(ns) : 100000;
++    const char * gs = getenv("GGML_METAL_MOE_FILL_GAP_US"); // idle gap after each dispatch: duty-cycles the filler
++    const useconds_t gap = gs ? (useconds_t) atoi(gs) : 0;
++    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
++    const uint64_t win = (uint64_t) (50e6 * tb.denom / tb.numer); // 50 ms in ticks
++    id<MTLCommandBuffer> inflight[2] = { nil, nil };
++    int k = 0;
++    long n_fill = 0;
++    for (;;) {
++        @autoreleasepool {
++            if (mach_absolute_time() - g_fill_last < win) {
++                if (inflight[k]) { [inflight[k] waitUntilCompleted]; [inflight[k] release]; inflight[k] = nil; }
++                id<MTLCommandBuffer> cb = [q commandBuffer];
++                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
++                [enc setComputePipelineState:pso];
++                [enc setBuffer:buf offset:0 atIndex:0];
++                [enc setBytes:&n length:sizeof(n) atIndex:1];
++                [enc dispatchThreads:MTLSizeMake(32, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
++                [enc endEncoding];
++                [cb commit];
++                inflight[k] = [cb retain];
++                k ^= 1;
++                if (++n_fill % 100000 == 0) GGML_LOG_INFO("%s: %ld filler dispatches\n", __func__, n_fill);
++                if (gap > 0) usleep(gap);
++            } else {
++                usleep(1000);
++            }
++        }
++    }
++    return NULL;
++}
++static void fill_start(ggml_metal_device_t dev) {
++    static int started = 0;
++    if (started) return;
++    started = 1;
++    pthread_t th;
++    pthread_create(&th, NULL, fill_thread, (void *) ggml_metal_device_get_obj(dev));
++    pthread_detach(th);
++    GGML_LOG_INFO("%s: GPU keep-busy filler queue enabled\n", __func__);
++}
++static int spin_mode(void) { if (g_spin < 0) { const char * v = getenv("GGML_METAL_MOE_SPIN"); g_spin = v ? atoi(v) : 2; } /* filler on by default: it only runs while the expert cache is active */ return g_spin; }
++static void spin_init(ggml_metal_device_t dev) {
++    if (g_spin_pso) return;
++    id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(dev);
++    NSString * src = @"#include <metal_stdlib>\n"
++        "using namespace metal;\n"
++        "kernel void moe_spin(device atomic_uint * flag [[buffer(0)]], constant uint & want [[buffer(1)]], uint tid [[thread_position_in_grid]]) {\n"
++        "    if (tid != 0) return;\n"
++        "    uint n = 0;\n"
++        "    while ((int) (atomic_load_explicit(&flag[0], memory_order_relaxed) - want) < 0 && n < 50000000u) { n++; }\n"
++        "    atomic_store_explicit(&flag[1], n, memory_order_relaxed);\n"
++        "}\n";
++    NSError * err = nil;
++    id<MTLLibrary> lib = [device newLibraryWithSource:src options:nil error:&err];
++    if (!lib) { GGML_ABORT("moe_spin: %s", [[err description] UTF8String]); }
++    id<MTLFunction> fn = [lib newFunctionWithName:@"moe_spin"];
++    g_spin_pso = [device newComputePipelineStateWithFunction:fn error:&err];
++    if (!g_spin_pso) { GGML_ABORT("moe_spin pso: %s", [[err description] UTF8String]); }
++    g_spin_buf = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
++    memset([g_spin_buf contents], 0, 64);
++    [fn release]; [lib release];
++    GGML_LOG_INFO("%s: GPU spin-wait for the MoE go signal enabled\n", __func__);
++}
++
+ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+     GGML_LOG_INFO("%s: allocating\n", __func__);
+ 
+@@ -202,6 +375,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+ }
+ 
+ void ggml_metal_free(ggml_metal_t ctx) {
++    if (prof_mode() > 0) { os_unfair_lock_lock(&g_prof_lock); prof_report(); os_unfair_lock_unlock(&g_prof_lock); }
+     GGML_LOG_INFO("%s: deallocating\n", __func__);
+ 
+     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+@@ -711,6 +885,7 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
+ }
+ 
+ void ggml_metal_moe_mark(ggml_metal_t ctx, uint64_t * v_done, uint64_t * v_go) {
++    if (spin_mode() == 2) { fill_start(ctx->dev); g_fill_last = mach_absolute_time(); }
+     if (!g_moe_inbuf) {
+         id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(ctx->dev);
+         g_moe_done_ev = [device newSharedEvent];
+@@ -744,6 +919,8 @@ void ggml_metal_moe_inbuf_host_wait(uint64_t value, int spin) {
+ 
+ void ggml_metal_moe_inbuf_host_signal(uint64_t value) {
+     @autoreleasepool {
++        if (prof_mode() > 0) { g_prof_go_t[value % PROF_RING] = prof_now(); }
++        if (spin_mode() == 1 && g_spin_buf) { __atomic_store_n((uint32_t *) [g_spin_buf contents], (uint32_t) value, __ATOMIC_RELEASE); }
+         g_moe_go_ev.signaledValue = value;
+     }
+ }
+@@ -852,11 +1029,61 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+         id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+ 
+         const bool moe_inbuf = g_moe_inbuf && cb_idx == n_cb_l; // n_cb is 0 in this mode: the only command buffer
++        uint64_t prof_go_v = 0;
+         if (moe_inbuf && g_moe_pending_go != 0) {
++            prof_go_v = g_moe_pending_go;
++            if (spin_mode() == 1) {
++                spin_init(ctx->dev);
++                const uint32_t want = (uint32_t) g_moe_pending_go;
++                id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
++                [enc setComputePipelineState:g_spin_pso];
++                [enc setBuffer:g_spin_buf offset:0 atIndex:0];
++                [enc setBytes:&want length:sizeof(want) atIndex:1];
++                [enc dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
++                [enc endEncoding];
++            }
+             [cmd_buf encodeWaitForEvent:g_moe_go_ev value:g_moe_pending_go];
+             g_moe_pending_go = 0;
+         }
+ 
++        // (profiling) decode = the graph carries one token (HC streams x tokens <= 4 on the first nodes)
++        const int pm = cb_idx == n_cb_l ? prof_mode() : 0;
++        prof_rec_t * pr = NULL;
++        long pseq = -1;
++        void * psb = NULL;
++        if (pm > 0) {
++            // token count from the router logits [n_expert, n_tokens] of this split; a split without a router
++            // inherits the previous split's class; "ffn_moe_logits-0" starts a new token
++            static int dec_prev = 0;
++            int dec = dec_prev, last = 0;
++            for (int i = 0; i < ctx->gf->n_nodes; ++i) {
++                const struct ggml_tensor * t = ctx->gf->nodes[i];
++                if (strncmp(t->name, "ffn_moe_logits-", 15) == 0) {
++                    dec = t->ne[1] == 1;
++                    if (strcmp(t->name, "ffn_moe_logits-0") == 0) last = 1;
++                    break;
++                }
++            }
++            dec_prev = dec;
++            os_unfair_lock_lock(&g_prof_lock);
++            pseq = g_prof_seq++;
++            pr = &g_prof_rec[pseq % PROF_RING];
++            memset(pr, 0, offsetof(prof_rec_t, lab));
++            pr->decode = dec;
++            pr->last = last;
++            pr->go_v = prof_go_v;
++            pr->sb = -1;
++            os_unfair_lock_unlock(&g_prof_lock);
++            if (pm >= 2 && dec) {
++                const int s = g_prof_sb_i++ % PROF_NSB;
++                if (!g_prof_sb[s]) g_prof_sb[s] = ggml_metal_prof_create(ctx->dev, PROF_SAMP);
++                if (g_prof_sb_cb[s]) { [g_prof_sb_cb[s] waitUntilCompleted]; [g_prof_sb_cb[s] release]; }
++                g_prof_sb_cb[s] = [cmd_buf retain];
++                psb = g_prof_sb[s];
++                pr->sb = s;
++            }
++        }
++
+         ggml_metal_op_t ctx_op = ggml_metal_op_init(
+             ctx->dev,
+             cmd_buf,
+@@ -868,11 +1095,27 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+             ctx->capture_compute == 0,
+             ctx->debug_graph);
+ 
++        int np = 0;
+         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
++            if (psb && np < PROF_SAMP/2) {
++                ggml_metal_op_begin_sampled(ctx_op, psb, np);
++            }
+             const int res = ggml_metal_op_encode(ctx_op, idx);
+             if (res == 0) {
+                 break;
+             }
++            if (psb && np < PROF_SAMP/2) {
++                // label: op + node name without the layer number, + fused count
++                const struct ggml_tensor * t = ggml_metal_op_node_ptr(ctx_op, idx);
++                char nm[40]; snprintf(nm, sizeof(nm), "%s", t->name);
++                for (char * q = nm; *q; ++q) { if (*q >= '0' && *q <= '9') { *q = 0; break; } }
++                char lab[64];
++                if (res > 1) snprintf(lab, sizeof(lab), "%s:%s+%d", ggml_op_name(t->op), nm, res);
++                else         snprintf(lab, sizeof(lab), "%s:%s", ggml_op_name(t->op), nm);
++                os_unfair_lock_lock(&g_prof_lock);
++                pr->lab[np++] = prof_label(lab);
++                os_unfair_lock_unlock(&g_prof_lock);
++            }
+ 
+             idx += res - 1;
+         }
+@@ -883,6 +1126,39 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+             [cmd_buf encodeSignalEvent:g_moe_done_ev value:++g_moe_done_last];
+         }
+ 
++        if (pr) {
++            pr->nsamp = np;
++            const long seq = pseq;
++            [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++                os_unfair_lock_lock(&g_prof_lock);
++                prof_rec_t * r = &g_prof_rec[seq % PROF_RING];
++                r->gs = [cb GPUStartTime];
++                r->ge = [cb GPUEndTime];
++                if (r->go_v) r->go_t = g_prof_go_t[r->go_v % PROF_RING];
++                if (r->sb >= 0 && r->nsamp > 0) {
++                    static uint64_t ts[PROF_SAMP];
++                    const int n = r->nsamp;
++                    const int m = ggml_metal_prof_resolve(g_prof_sb[r->sb], 2*n, ts);
++                    if (m >= 2*n) {
++                        double sum = 0;
++                        for (int i = 0; i < n; ++i) {
++                            const uint64_t a = ts[2*i], b = ts[2*i + 1];
++                            if (a == 0 || b == 0 || a == ~0ULL || b == ~0ULL || b < a) continue;
++                            const double us = (double) (b - a) * 1e-3; // GPU timestamps are ns
++                            g_prof_lab_us[r->lab[i]]  += us;
++                            g_prof_lab_cnt[r->lab[i]] += 1;
++                            sum += us;
++                        }
++                        g_prof_opsum += sum;
++                    }
++                }
++                r->done = 1;
++                prof_advance();
++                os_unfair_lock_unlock(&g_prof_lock);
++            }];
++            pr->commit = prof_now();
++        }
++
+         if (cb_idx < 2 || ctx->abort_callback == NULL) {
+             [cmd_buf commit];
+         }
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 0942097d7..4c37f4c02 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1405,8 +1405,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
+         case GGML_TYPE_TQ27_128:
+         case GGML_TYPE_TQ81_128:
+             {
+-                nsg = N_SG_TQD;
+-                nr0 = N_R0_TQD;
++                nsg = N_SG_TQD_ID;
++                nr0 = N_R0_TQD_ID;
+             } break;
+         case GGML_TYPE_Q4_0:
+             {
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 86039caad..17a1d11a2 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -91,6 +91,11 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
+ 
+ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
+ 
++// (profiling, GGML_METAL_OPPROF) per-encoder GPU timestamps
++void * ggml_metal_prof_create(ggml_metal_device_t dev, int n_samples);
++ggml_metal_encoder_t ggml_metal_encoder_init_sampled(ggml_metal_cmd_buf_t cmd_buf, bool concurrent, void * sbuf, int i);
++int    ggml_metal_prof_resolve(void * sbuf, int n_samples, uint64_t * out);
++
+ //
+ // MTLLibrary wrapper
+ //
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index d1bce8bad..512fae7b9 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -833,6 +833,52 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
+     id<MTLComputeCommandEncoder> obj;
+ };
+ 
++// (profiling, GGML_METAL_OPPROF) per-encoder GPU timestamps at stage boundaries
++void * ggml_metal_prof_create(ggml_metal_device_t dev, int n) {
++    id<MTLDevice> device = ggml_metal_device_get_obj(dev);
++    if (![device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
++        GGML_LOG_ERROR("%s: stage-boundary counter sampling not supported\n", __func__);
++        return NULL;
++    }
++    id<MTLCounterSet> ts = nil;
++    for (id<MTLCounterSet> cs in device.counterSets) {
++        if ([cs.name isEqualToString:MTLCommonCounterSetTimestamp]) ts = cs;
++    }
++    if (!ts) return NULL;
++    MTLCounterSampleBufferDescriptor * d = [[MTLCounterSampleBufferDescriptor alloc] init];
++    d.counterSet = ts;
++    d.storageMode = MTLStorageModeShared;
++    d.sampleCount = n;
++    NSError * err = nil;
++    id<MTLCounterSampleBuffer> sb = [device newCounterSampleBufferWithDescriptor:d error:&err];
++    [d release];
++    if (!sb) { GGML_LOG_ERROR("%s: %s\n", __func__, [[err description] UTF8String]); return NULL; }
++    return (void *) sb;
++}
++
++ggml_metal_encoder_t ggml_metal_encoder_init_sampled(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent, void * sbuf, int i) {
++    ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
++    id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
++    MTLComputePassDescriptor * pd = [MTLComputePassDescriptor computePassDescriptor];
++    pd.dispatchType = concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
++    pd.sampleBufferAttachments[0].sampleBuffer = (id<MTLCounterSampleBuffer>) sbuf;
++    pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = 2*i;
++    pd.sampleBufferAttachments[0].endOfEncoderSampleIndex   = 2*i + 1;
++    res->obj = [cmd_buf computeCommandEncoderWithDescriptor:pd];
++    [res->obj retain];
++    return res;
++}
++
++int ggml_metal_prof_resolve(void * sbuf, int n, uint64_t * out) {
++    id<MTLCounterSampleBuffer> sb = (id<MTLCounterSampleBuffer>) sbuf;
++    NSData * data = [sb resolveCounterRange:NSMakeRange(0, n)];
++    if (!data) return 0;
++    const MTLCounterResultTimestamp * ts = (const MTLCounterResultTimestamp *) data.bytes;
++    const int m = (int) (data.length / sizeof(MTLCounterResultTimestamp));
++    for (int k = 0; k < m && k < n; ++k) out[k] = ts[k].timestamp;
++    return m;
++}
++
+ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
+     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 350b7ba4c..8571604a6 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -36,6 +36,14 @@
+ #ifndef N_SG_TQD
+ #define N_SG_TQD 2
+ #endif
++// expert (mul_mv_id) occupancy, separate from the dense one: the base-M5 sweep (125B shapes) has the expert matmuls fastest at
++// more rows per simdgroup (8_1: gate/up 0.90x, down 0.68x of 2_2) while dense and the output layer stay best at 2_2
++#ifndef N_R0_TQD_ID
++#define N_R0_TQD_ID 8
++#endif
++#ifndef N_SG_TQD_ID
++#define N_SG_TQD_ID 1
++#endif
+ 
+ #define N_R0_Q4_0 4
+ #define N_SG_Q4_0 2
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index f10d63dae..5f97dee4a 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -56,6 +56,7 @@ struct ggml_metal_op {
+         this->dev             = dev;
+         this->lib             = ggml_metal_device_get_library(dev);
+         this->enc             = ggml_metal_encoder_init(cmd_buf, use_concurrency);
++        this->cmd_buf_raw     = cmd_buf;
+         this->mem_ranges      = ggml_mem_ranges_init(debug_graph);
+         this->finfo           = finfo;
+         this->idx_start       = idx_start;
+@@ -125,6 +126,7 @@ struct ggml_metal_op {
+     ggml_metal_device_t  dev;
+     ggml_metal_library_t lib;
+     ggml_metal_encoder_t enc;
++    ggml_metal_cmd_buf_t cmd_buf_raw;
+     ggml_mem_ranges_t    mem_ranges;
+ 
+     // shared fusion debugging context
+@@ -571,6 +573,15 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+     return n_fuse;
+ }
+ 
++// (profiling, GGML_METAL_OPPROF=2) start a fresh sampled encoder for the next op
++const struct ggml_tensor * ggml_metal_op_node_ptr(ggml_metal_op_t ctx, int i) { return ctx->node(i); }
++void ggml_metal_op_begin_sampled(ggml_metal_op_t ctx, void * sbuf, int i) {
++    ggml_metal_encoder_end_encoding(ctx->enc);
++    ggml_metal_encoder_free(ctx->enc);
++    ctx->enc = ggml_metal_encoder_init_sampled(ctx->cmd_buf_raw, ctx->use_concurrency, sbuf, i);
++    if (ctx->mem_ranges) ggml_mem_ranges_reset(ctx->mem_ranges);
++}
++
+ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+     if (ctx->use_capture) {
+         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index 6696dc0b0..7ffcc43b1 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -33,6 +33,10 @@ void ggml_metal_op_free(ggml_metal_op_t ctx);
+ 
+ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
+ 
++// (profiling, GGML_METAL_OPPROF=2)
++const struct ggml_tensor * ggml_metal_op_node_ptr(ggml_metal_op_t ctx, int i);
++void ggml_metal_op_begin_sampled(ggml_metal_op_t ctx, void * sbuf, int i);
++
+ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
+ 
+ //
+diff --git a/ggml/src/ggml-metal/kernels/mul_mm.metal b/ggml/src/ggml-metal/kernels/mul_mm.metal
+index 276bf5187..e3f44ed55 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mm.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mm.metal
+@@ -705,6 +705,7 @@ template [[host_name("kernel_mul_mm_id_map0_ne20_4" )]] kernel kernel_mul_mm_id_
+ template [[host_name("kernel_mul_mm_id_map0_ne20_5" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<5>;
+ template [[host_name("kernel_mul_mm_id_map0_ne20_6" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<6>;
+ template [[host_name("kernel_mul_mm_id_map0_ne20_8" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<8>;
++template [[host_name("kernel_mul_mm_id_map0_ne20_9" )]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<9>;
+ template [[host_name("kernel_mul_mm_id_map0_ne20_10")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<10>;
+ template [[host_name("kernel_mul_mm_id_map0_ne20_16")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<16>;
+ template [[host_name("kernel_mul_mm_id_map0_ne20_22")]] kernel kernel_mul_mm_id_map0_t kernel_mul_mm_id_map0<22>;
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index ccd56eb46..7c91813f5 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -3513,9 +3513,9 @@ template [[host_name("kernel_mul_mv_id_q4_0_f32")]]    kernel kernel_mul_mv_id_t
+ template [[host_name("kernel_mul_mv_id_q4_1_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q4_1, N_R0_Q4_1>>>;
+ template [[host_name("kernel_mul_mv_id_q5_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q5_0, N_R0_Q5_0>>>;
+ template [[host_name("kernel_mul_mv_id_q5_1_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<mul_vec_q_n_f32_impl<block_q5_1, N_R0_Q5_1>>>;
+-template [[host_name("kernel_mul_mv_id_tq9_128_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tqd_f32_impl<block_tq9_128, 9, 16, N_R0_TQD>>>;
+-template [[host_name("kernel_mul_mv_id_tq27_128_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tqd_f32_impl<block_tq27_128, 27, 24, N_R0_TQD>>>;
+-template [[host_name("kernel_mul_mv_id_tq81_128_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tqd_f32_impl<block_tq81_128, 81, 32, N_R0_TQD>>>;
++template [[host_name("kernel_mul_mv_id_tq9_128_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tqd_f32_impl<block_tq9_128, 9, 16, N_R0_TQD_ID>>>;
++template [[host_name("kernel_mul_mv_id_tq27_128_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tqd_f32_impl<block_tq27_128, 27, 24, N_R0_TQD_ID>>>;
++template [[host_name("kernel_mul_mv_id_tq81_128_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tqd_f32_impl<block_tq81_128, 81, 32, N_R0_TQD_ID>>>;
+ 
+ template [[host_name("kernel_mul_mv_id_mxfp4_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_mxfp4_f32_impl<N_R0_MXFP4>>>;
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index bec8bbfc0..f709464b2 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -553,6 +553,26 @@ llama_context::llama_context(
+         }
+ 
+         if (cparams.moe_cache_size > 0) {
++            // (tq expert cache) the cache size is set for a reference window (LLAMA_MOE_CACHE_REF_CTX, 4096); a larger window
++            // hands its extra attention KV back from the cache so the total stays inside the GPU budget (16 GB Mac: 32k at
++            // a 4k-sized cache over-fills it and everything slows ~1.6x). LLAMA_MOE_CACHE_REF_CTX=0 turns this off.
++            const long ref_ctx = getenv("LLAMA_MOE_CACHE_REF_CTX") ? atol(getenv("LLAMA_MOE_CACHE_REF_CTX")) : 4096;
++            if (ref_ctx > 0 && (long) cparams.n_ctx > ref_ctx) {
++                const auto & hp = model.hparams;
++                size_t kv_cell = 0; // bytes per cell over the attention layers
++                for (uint32_t il = 0; il < hp.n_layer(); ++il) {
++                    if (hp.is_recr(il)) {
++                        continue;
++                    }
++                    kv_cell += ggml_row_size(params.type_k, hp.n_embd_k_gqa(il)) + ggml_row_size(params.type_v, hp.n_embd_v_gqa(il));
++                }
++                const size_t give = (size_t) ((double) kv_cell * (double) (cparams.n_ctx - ref_ctx) * 1.1); // +10 %: indexer keys, buffers
++                const size_t floor_sz = cparams.moe_cache_size / 4;
++                const size_t new_sz = cparams.moe_cache_size > give + floor_sz ? cparams.moe_cache_size - give : floor_sz;
++                LLAMA_LOG_INFO("%s: moe cache %zu -> %zu MiB for n_ctx %u (ref %ld, attention KV %zu B/cell)\n", __func__,
++                    cparams.moe_cache_size >> 20, new_sz >> 20, cparams.n_ctx, ref_ctx, kv_cell);
++                cparams.moe_cache_size = new_sz;
++            }
+             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+         }
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index d842d4265..b9d1c3769 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1403,6 +1403,31 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
+     std::fill(hparams.n_expert_used_arr.begin(), hparams.n_expert_used_arr.end(), 0);
+     ml.get_key_or_arr(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used_arr, hparams.n_layer_all, false);
++    // (tq expert cache) Qwen4Exp on the SSD expert cache (LLAMA_MOE_SSD=1, the 16 GB Mac path): 8 routed experts per token by default
++    // (vs the model's 10: +21-25 % decode on a 16 GB MacBook Air, GSM8K / HumanEval / MBPP / IFEval n.s.). LLAMA_MOE_EXPERTS=N picks
++    // another count, LLAMA_MOE_EXPERTS=0 keeps the model's own; an explicit --override-kv <arch>.expert_used_count always wins.
++    // Only counts with a Metal MUL_MAT_ID map0 kernel (1, 2, 4, 5, 6, 8, 9, 10) and not above the model's own are accepted.
++    if (arch == LLM_ARCH_QWEN4EXP && getenv("LLAMA_MOE_SSD") && atoi(getenv("LLAMA_MOE_SSD")) != 0 &&
++            ml.kv_overrides.find(ml.llm_kv(LLM_KV_EXPERT_USED_COUNT)) == ml.kv_overrides.end()) {
++        const char * ne = getenv("LLAMA_MOE_EXPERTS");
++        const int32_t n_req = ne ? atoi(ne) : 8;
++        uint32_t n_model = 0;
++        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
++            n_model = std::max(n_model, hparams.n_expert_used_arr[il]);
++        }
++        const bool has_kernel = n_req == 1 || n_req == 2 || n_req == 4 || n_req == 5 || n_req == 6 || n_req == 8 || n_req == 9 || n_req == 10;
++        if (n_req > 0 && (!has_kernel || (uint32_t) n_req > n_model)) {
++            LLAMA_LOG_WARN("%s: LLAMA_MOE_EXPERTS=%d not supported (allowed: 1, 2, 4, 5, 6, 8, 9, 10, at most the model's %u); using the model's %u\n",
++                    __func__, n_req, n_model, n_model);
++        } else if (n_req > 0 && (uint32_t) n_req < n_model) {
++            for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
++                if (hparams.n_expert_used_arr[il] > (uint32_t) n_req) {
++                    hparams.n_expert_used_arr[il] = n_req;
++                }
++            }
++            LLAMA_LOG_INFO("%s: expert cache: %d routed experts per token (model: %u; LLAMA_MOE_EXPERTS=0 for the model's own)\n", __func__, n_req, n_model);
++        }
++    }
+     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
+     ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
+ 
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 5f0d643b0..7c98f1173 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -857,6 +857,7 @@ struct llama_model {
+         size_t       size = 0;
+     };
+     std::vector<file_map> file_maps;
++    std::string path_given; // (tq expert cache) model path as passed by the caller (before symlink resolution), for the .trpw sidecar lookup
+ 
+     // statically allocated context for assigning
+     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index f7c3d7f15..ebc50f3d5 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#include <cmath>
+ #include <condition_variable>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -18,6 +19,7 @@
+ #include <thread>
+ 
+ #include <fcntl.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ #include <unordered_map>
+ #include <vector>
+@@ -229,29 +231,42 @@ struct moe_ssd_pool {
+         }
+     }
+ 
+-    // run all jobs in parallel and wait for them
+-    void run(std::vector<job> & js) {
++    // queue jobs, the workers start at once
++    void submit(const std::vector<job> & js) {
+         if (js.empty()) {
+             return;
+         }
+         {
+             std::lock_guard<std::mutex> lk(mtx);
+-            jobs.swap(js);
+-            next = 0;
+-            n_done = 0;
++            jobs.insert(jobs.end(), js.begin(), js.end());
+         }
+         cv_work.notify_all();
++    }
++
++    // wait for all queued jobs
++    void wait() {
+         {
+             std::unique_lock<std::mutex> lk(mtx);
+             cv_done.wait(lk, [this] { return n_done == jobs.size(); });
+-            jobs.swap(js);
+             jobs.clear();
+             next = 0;
++            n_done = 0;
+         }
+         if (n_err.load() != 0) {
+             GGML_ABORT("llama_moe_cache: pread failed");
+         }
+     }
++
++    bool idle() {
++        std::lock_guard<std::mutex> lk(mtx);
++        return n_done == jobs.size();
++    }
++
++    // run all jobs in parallel and wait for them
++    void run(std::vector<job> & js) {
++        submit(js);
++        wait();
++    }
+ };
+ 
+ static int64_t moe_now_ns() {
+@@ -374,6 +389,27 @@ struct llama_moe_cache::impl {
+ 
+     int32_t n_expert_used;
+ 
++    // (tq expert cache) LLAMA_MOE_PRED=1 logs, =2 prefetches: the graph computes the router of layer il + 1 on the FFN input of
++    // layer il; after "go" of layer il the resolver reads the predicted misses of layer il + 1 while the GPU runs on
++    int pred_mode = 0;
++    int32_t pred_k_ = 0;
++    std::vector<ggml_tensor *> pred_t;              // [il] tensor predicting layer il
++    std::vector<std::vector<int32_t>> pred_ids;     // [il] predicted experts, read after "done" of layer il - 1
++    std::vector<uint64_t> pred_gen;                 // [il] n_ub when pred_ids[il] was read
++    float pred_p = 0.0f;                            // LLAMA_MOE_PRED_P: read a predicted expert only if its router probability is at least this
++    std::vector<std::vector<std::pair<int32_t, float>>> pred_top; // [il] the most likely experts (id, probability), for the trace
++    FILE * trace_fp = nullptr;                      // LLAMA_MOE_PRED_TRACE: binary record of every resolve (ub, il, ids, predicted top)
++    std::vector<float> pred_prob;
++    std::vector<int32_t> pred_ord;
++    std::vector<int32_t> pf_set;                    // experts prefetched for the next layer
++    int32_t pf_layer = -1;
++    bool pf_pending = false;
++    struct pred_stats {
++        size_t n_layers = 0, actual = 0, overlap = 0, misses = 0, covered = 0;
++        size_t pf_reads = 0, pf_used = 0;
++        int64_t pf_wait_ns = 0;
++    } pst;
++
+     stats stats_small; // up to 8 tokens per ubatch
+     stats stats_large;
+     stats stats_copy;  // experts copied from the cache for large batches
+@@ -395,9 +431,27 @@ struct llama_moe_cache::impl {
+     // views used by copy_experts
+     ggml_context_ptr ctx_views;
+ 
++    // (tq expert cache) LLAMA_MOE_PRED_W: learned predictor maps, indexed by the predicted layer
++    ggml_context_ptr ctx_pw;
++    ggml_backend_buffer_ptr buf_pw;
++    std::vector<ggml_tensor *> pw_w, pw_b;
++
+     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+         max_batch = moe_env_long("LLAMA_MOE_CACHE_MAX_BATCH", 32);
++        // prefetch is on by default (it only acts with the SSD async cache, see pred_k()); 6 experts measured best on a 16 GB MacBook Air
++        pred_mode = (int) moe_env_long("LLAMA_MOE_PRED", 2);
++        pred_k_   = pred_mode > 0 ? (int32_t) moe_env_long("LLAMA_MOE_PRED_K", 6) : 0;
++        pred_t.assign(model.layers.size(), nullptr);
++        pred_ids.assign(model.layers.size(), {});
++        pred_gen.assign(model.layers.size(), (uint64_t) -1);
++        pred_top.assign(model.layers.size(), {});
++        if (const char * pp = getenv("LLAMA_MOE_PRED_P")) {
++            pred_p = (float) atof(pp);
++        }
++        if (const char * tp = getenv("LLAMA_MOE_PRED_TRACE"); tp && pred_mode > 0) {
++            trace_fp = fopen(tp, "wb");
++        }
+         ssd       = moe_env_long("LLAMA_MOE_SSD", 0) != 0;
+         ssd_chunk = std::min((size_t) moe_env_long("LLAMA_MOE_SSD_CHUNK", (long) ssd_chunk), (size_t) 1u << 20);
+         layer_miss_small.assign(model.layers.size(), 0);
+@@ -609,6 +663,143 @@ struct llama_moe_cache::impl {
+             }
+         }
+ 
++        // (tq expert cache) LLAMA_MOE_PRED_W=file: learned next-layer predictor, replaces the router of layer il + 1 on the FFN
++        // input of layer il in the prefetch graph; it only changes which experts are read ahead, never the computed result
++        pw_w.assign(model.layers.size(), nullptr);
++        pw_b.assign(model.layers.size(), nullptr);
++        // default: with LLAMA_MOE_PRED_W unset and the SSD cache on, use <model file without -0000N-of-0000M.gguf / .gguf>.trpw if it
++        // exists next to the model path as given (then next to the resolved file); LLAMA_MOE_PRED_W= (empty) turns the learned predictor off.
++        // An auto-found sidecar that fails to load only warns and falls back to the layer L+1 router; an explicit LLAMA_MOE_PRED_W stays fatal.
++        auto trpw_of = [](std::string stem) {
++            const size_t dot = stem.rfind(".gguf");
++            if (dot != std::string::npos) {
++                stem.resize(dot);
++            }
++            const size_t of = stem.rfind("-of-");
++            if (of != std::string::npos && of >= 6 && stem[of - 6] == '-') {
++                stem.resize(of - 6);
++            }
++            return stem + ".trpw";
++        };
++        const char * pw_env = getenv("LLAMA_MOE_PRED_W");
++        std::string pw_auto;
++        if (pw_env == nullptr && ssd) {
++            std::vector<std::string> cands;
++            if (!model.path_given.empty()) {
++                cands.push_back(trpw_of(model.path_given));
++            }
++            if (!model.file_maps.empty() && !model.file_maps[0].path.empty()) {
++                cands.push_back(trpw_of(model.file_maps[0].path));
++            }
++            for (const std::string & c : cands) {
++                struct stat st;
++                if (stat(c.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
++                    pw_auto = c;
++                    break;
++                }
++            }
++        }
++        const std::string pw_path = pw_env ? std::string(pw_env) : pw_auto;
++        auto load_pw = [&](const char * pwf) {
++            FILE * f = fopen(pwf, "rb");
++            if (!f) {
++                throw std::runtime_error(std::string("cannot open ") + pwf);
++            }
++            struct fcloser { FILE * f; ~fcloser() { fclose(f); } } fc{f};
++            char magic[4]; int32_t hdr[4];
++            if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "TRPW", 4) != 0 || fread(hdr, sizeof(int32_t), 4, f) != 4 || hdr[0] != 1 ||
++                    hdr[1] != (int32_t) model.hparams.n_embd || hdr[2] != (int32_t) model.hparams.n_expert) {
++                throw std::runtime_error("bad header or model mismatch");
++            }
++            const int32_t ne = hdr[1], nx = hdr[2], nm = hdr[3];
++            const long map_bytes = (long) ne*nx*2 + (long) nx*4;
++            if (nm <= 0 || nm >= (int32_t) model.layers.size()) {
++                throw std::runtime_error("bad map count " + std::to_string(nm));
++            }
++            fseek(f, 0, SEEK_END);
++            const long fsize = ftell(f);
++            if (fsize != 20 + (long) nm*(4 + map_bytes)) {
++                throw std::runtime_error("file size " + std::to_string(fsize) + " != expected " + std::to_string(20 + (long) nm*(4 + map_bytes)) + " (incomplete download?)");
++            }
++            fseek(f, 20, SEEK_SET);
++            std::vector<long> offs(nm);
++            std::vector<int32_t> lay(nm);
++            std::vector<bool> seen(model.layers.size(), false);
++            for (int32_t m = 0; m < nm; ++m) {
++                if (fread(&lay[m], sizeof(int32_t), 1, f) != 1 || lay[m] < 0 || lay[m] + 1 >= (int32_t) model.layers.size() || seen[lay[m] + 1]) {
++                    throw std::runtime_error("bad map");
++                }
++                seen[lay[m] + 1] = true;
++                offs[m] = ftell(f);
++                fseek(f, map_bytes, SEEK_CUR);
++            }
++            ggml_init_params params = { (size_t) (2*nm + 1)*ggml_tensor_overhead(), nullptr, true };
++            ctx_pw.reset(ggml_init(params));
++            for (int32_t m = 0; m < nm; ++m) {
++                const int32_t il = lay[m] + 1;
++                pw_w[il] = ggml_new_tensor_2d(ctx_pw.get(), GGML_TYPE_F16, ne, nx);
++                pw_b[il] = ggml_new_tensor_1d(ctx_pw.get(), GGML_TYPE_F32, nx);
++                ggml_format_name(pw_w[il], "moe_pred_w-%d", il);
++                ggml_format_name(pw_b[il], "moe_pred_b-%d", il);
++            }
++            if (model.hparams.no_alloc) {
++                buf_pw.reset(ggml_backend_buft_alloc_buffer(devices[0].buft, 0));
++                for (ggml_tensor * t = ggml_get_first_tensor(ctx_pw.get()); t != nullptr; t = ggml_get_next_tensor(ctx_pw.get(), t)) {
++                    t->buffer = buf_pw.get();
++                }
++                devices[0].buf_size += (size_t) nm*map_bytes;
++                return;
++            }
++            // read and check everything before the device allocation (non-finite values would silently waste prefetch reads)
++            std::vector<uint8_t> all((size_t) nm*map_bytes);
++            for (int32_t m = 0; m < nm; ++m) {
++                fseek(f, offs[m], SEEK_SET);
++                uint8_t * p = all.data() + (size_t) m*map_bytes;
++                if (fread(p, 1, map_bytes, f) != (size_t) map_bytes) {
++                    throw std::runtime_error("short read");
++                }
++                const ggml_fp16_t * w = (const ggml_fp16_t *) p;
++                for (long i = 0; i < (long) ne*nx; ++i) {
++                    if ((w[i] & 0x7c00) == 0x7c00) {
++                        throw std::runtime_error("non-finite weight in map " + std::to_string(m));
++                    }
++                }
++                const float * bb = (const float *) (p + (size_t) ne*nx*2);
++                for (int32_t i = 0; i < nx; ++i) {
++                    if (!std::isfinite(bb[i])) {
++                        throw std::runtime_error("non-finite bias in map " + std::to_string(m));
++                    }
++                }
++            }
++            buf_pw.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_pw.get(), devices[0].buft));
++            if (!buf_pw) {
++                throw std::runtime_error("failed to allocate");
++            }
++            for (int32_t m = 0; m < nm; ++m) {
++                const int32_t il = lay[m] + 1;
++                const uint8_t * p = all.data() + (size_t) m*map_bytes;
++                ggml_backend_tensor_set(pw_w[il], p, 0, (size_t) ne*nx*2);
++                ggml_backend_tensor_set(pw_b[il], p + (size_t) ne*nx*2, 0, (size_t) nx*4);
++            }
++            devices[0].buf_size += ggml_backend_buffer_get_size(buf_pw.get());
++            LLAMA_LOG_INFO("llama_moe_cache: learned predictor: %d maps, %.1f MiB (%s)\n", nm,
++                    ggml_backend_buffer_get_size(buf_pw.get())/1024.0/1024.0, pwf);
++        };
++        if (!pw_path.empty() && pred_mode > 0) {
++            try {
++                load_pw(pw_path.c_str());
++            } catch (const std::exception & e) {
++                if (pw_env != nullptr) {
++                    throw std::runtime_error(std::string("LLAMA_MOE_PRED_W: ") + e.what());
++                }
++                LLAMA_LOG_WARN("llama_moe_cache: learned predictor sidecar %s not used (%s); using the router for prefetch\n", pw_path.c_str(), e.what());
++                pw_w.assign(model.layers.size(), nullptr);
++                pw_b.assign(model.layers.size(), nullptr);
++                buf_pw.reset();
++                ctx_pw.reset();
++            }
++        }
++
+         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
+         for (device & d : devices) {
+             if (d.buf) {
+@@ -812,10 +1003,21 @@ struct llama_moe_cache::impl {
+             fn_host_wait(j.v_done, async_spin);
+             const int64_t t1 = moe_now_ns();
+             ids.assign(j.sel, j.sel + j.n_ids);
++            // the prediction for the next layer was computed in the split that just finished
++            const int32_t il_next = j.il + 1;
++            const bool use_pred = pred_mode > 0 && j.n_ids == n_expert_used && il_next < (int32_t) layers.size() &&
++                layers[il_next].ig >= 0 && pred_t[il_next] != nullptr && pred_t[il_next]->data != nullptr;
++            if (use_pred) {
++                pick_pred(il_next, (const float *) pred_t[il_next]->data, (int32_t) pred_t[il_next]->ne[0]);
++                pred_gen[il_next] = n_ub;
++            }
+             resolve(j.il, t1 - t0, t1, [&](const int32_t * data, size_t nbytes) { memcpy(j.dst, data, nbytes); });
+             if (j.v_go != 0) {
+                 fn_host_signal(j.v_go);
+             }
++            if (use_pred && pred_mode >= 2) {
++                prefetch(il_next);
++            }
+             const int64_t stall = moe_now_ns() - t1;
+             (j.n_ids <= 8*n_expert_used ? stall_ns_small : stall_ns_large) += stall;
+         }
+@@ -847,12 +1049,19 @@ struct llama_moe_cache::impl {
+             resolver.join();
+         }
+         flush_ub();
++        if (trace_fp) {
++            fclose(trace_fp);
++        }
+         if (stats_fp) {
+             fprintf(stats_fp, "# layer_miss_small");
+             for (size_t m : layer_miss_small) {
+                 fprintf(stats_fp, " %zu", m);
+             }
+-            fprintf(stats_fp, "\n# totals small hits %zu misses %zu bytes %zu | large hits %zu misses %zu bytes %zu\n",
++            if (pred_mode > 0) {
++            fprintf(stats_fp, "\n# pred k %d mode %d layers %zu actual %zu overlap %zu misses %zu covered %zu pf_reads %zu pf_used %zu pf_wait_ms %.1f",
++                pred_k_, pred_mode, pst.n_layers, pst.actual, pst.overlap, pst.misses, pst.covered, pst.pf_reads, pst.pf_used, pst.pf_wait_ns/1e6);
++        }
++        fprintf(stats_fp, "\n# totals small hits %zu misses %zu bytes %zu | large hits %zu misses %zu bytes %zu\n",
+                 stats_small.hits, stats_small.misses, stats_small.bytes, stats_large.hits, stats_large.misses, stats_large.bytes);
+         }
+         log_stats();
+@@ -998,12 +1207,132 @@ struct llama_moe_cache::impl {
+         return true;
+     }
+ 
++    // (tq expert cache) the experts to read for layer il from its router logits: the pred_k_ most likely, those with probability at least pred_p
++    void pick_pred(int32_t il, const float * logits, int32_t n) {
++        float mx = logits[0];
++        for (int32_t i = 1; i < n; ++i) {
++            mx = std::max(mx, logits[i]);
++        }
++        pred_prob.resize(n);
++        double sum = 0.0;
++        for (int32_t i = 0; i < n; ++i) {
++            pred_prob[i] = expf(logits[i] - mx);
++            sum += pred_prob[i];
++        }
++        pred_ord.resize(n);
++        for (int32_t i = 0; i < n; ++i) {
++            pred_ord[i] = i;
++        }
++        const int32_t n_top = std::min<int32_t>(n, std::max<int32_t>(pred_k_, 32));
++        std::partial_sort(pred_ord.begin(), pred_ord.begin() + n_top, pred_ord.end(),
++            [&](int32_t a, int32_t b) { return pred_prob[a] > pred_prob[b] || (pred_prob[a] == pred_prob[b] && a < b); });
++        auto & ids_out = pred_ids[il];
++        ids_out.clear();
++        for (int32_t r = 0; r < std::min(pred_k_, n_top); ++r) {
++            const int32_t e = pred_ord[r];
++            if (pred_prob[e]/sum < pred_p) {
++                break;
++            }
++            ids_out.push_back(e);
++        }
++        if (trace_fp) {
++            auto & top = pred_top[il];
++            top.clear();
++            for (int32_t r = 0; r < std::min(n_top, 32); ++r) {
++                top.push_back({ pred_ord[r], (float) (pred_prob[pred_ord[r]]/sum) });
++            }
++        }
++    }
++
++    void trace_resolve(int32_t il) {
++        const bool has_pred = pred_gen[il] == n_ub && !pred_top[il].empty();
++        const int32_t hdr[4] = { (int32_t) n_ub, il, (int32_t) ids.size(), has_pred ? (int32_t) pred_top[il].size() : 0 };
++        fwrite(hdr, sizeof(hdr), 1, trace_fp);
++        fwrite(ids.data(), sizeof(int32_t), ids.size(), trace_fp);
++        if (has_pred) {
++            fwrite(pred_top[il].data(), sizeof(std::pair<int32_t, float>), pred_top[il].size(), trace_fp);
++        }
++    }
++
++    // (tq expert cache) read the predicted misses of layer il without waiting; resolve(il) waits for them before it plans
++    void prefetch(int32_t il) {
++        const layer & l = layers[il];
++        group & g = groups[l.ig];
++        pf_set.clear();
++        pf_layer = il;
++        int32_t * slots = g.lru.slot_map[il];
++        std::vector<moe_cache_lru::fill> pfills;
++        for (int32_t e : pred_ids[il]) {
++            if (e < 0 || e >= g.lru.n_expert || slots[e] >= 0 || std::find(pf_set.begin(), pf_set.end(), e) != pf_set.end()) {
++                continue;
++            }
++            const int32_t s = g.lru.head;
++            if (g.lru.key_of[s] >= 0) {
++                g.lru.slot_map[g.lru.key_of[s] / g.lru.n_expert][g.lru.key_of[s] % g.lru.n_expert] = -1;
++            }
++            g.lru.key_of[s] = il*g.lru.n_expert + e;
++            slots[e] = s;
++            g.lru.touch(s);
++            pf_set.push_back(e);
++            pfills.push_back({ e, s });
++        }
++        if (pfills.empty()) {
++            return;
++        }
++        std::vector<moe_ssd_pool::job> pjobs;
++        for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++            const size_t expert_size = l.experts[ip]->nb[2];
++            for (const auto & fl : pfills) {
++                uint8_t * dst = (uint8_t *) g.banks[ip]->data + (size_t) fl.slot*expert_size;
++                const off_t off = ssd_off[il][ip] + (off_t) fl.expert*(off_t) expert_size;
++                for (size_t c = 0; c < expert_size; c += ssd_chunk) {
++                    pjobs.push_back({ ssd_fds[ssd_fd_of[il][ip]], dst + c, std::min(ssd_chunk, expert_size - c), off + (off_t) c });
++                }
++                ub.bytes += expert_size;
++                stats_small.bytes += expert_size;
++            }
++        }
++        pst.pf_reads += pfills.size();
++        pool->submit(pjobs);
++        pf_pending = true;
++    }
++
+     // plan the slots of the selected experts (ids), load the misses, write the slot map with put_slot_map, record the stats
+     template <typename F>
+     void resolve(int32_t il, int64_t t_wait, int64_t t_cb0, F && put_slot_map, ggml_backend_t backend = nullptr) {
+         const layer & l = layers[il];
+         group & g = groups[l.ig];
+ 
++        if (pf_pending) {
++            const int64_t tw = moe_now_ns();
++            pool->wait();
++            pst.pf_wait_ns += moe_now_ns() - tw;
++            pf_pending = false;
++        }
++        if (trace_fp) {
++            trace_resolve(il);
++        }
++        if (pred_mode > 0 && ids.size() == (size_t) n_expert_used && pred_gen[il] == n_ub) {
++            const int32_t * slots = g.lru.slot_map[il];
++            const auto & pr = pred_ids[il];
++            pst.n_layers++;
++            for (int32_t e : ids) {
++                const bool in_pred = std::find(pr.begin(), pr.end(), e) != pr.end();
++                const bool was_pf  = pf_layer == il && std::find(pf_set.begin(), pf_set.end(), e) != pf_set.end();
++                pst.actual++;
++                pst.overlap += in_pred;
++                // a miss without the prefetch: not cached, or cached only because it was prefetched
++                if (slots[e] < 0 || was_pf) {
++                    pst.misses++;
++                    pst.covered += in_pred;
++                }
++                pst.pf_used += was_pf;
++            }
++        }
++        if (pf_layer == il) {
++            pf_layer = -1;
++        }
++
+         size_t n_hit = 0;
+         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+@@ -1115,6 +1444,12 @@ struct llama_moe_cache::impl {
+         if (async) {
+             LLAMA_LOG_INFO("llama_moe_cache: async: GPU held by the resolver %.1f ms (ubatch <= 8), %.1f ms (ubatch > 8)\n", stall_ns_small/1e6, stall_ns_large/1e6);
+         }
++        if (pred_mode > 0 && pst.actual > 0) {
++            LLAMA_LOG_INFO("llama_moe_cache: pred p>=%.3f\n", pred_p);
++            LLAMA_LOG_INFO("llama_moe_cache: pred k=%d mode %d: %zu layers, overlap %.1f%%, misses %zu covered %.1f%%, prefetched %zu used %zu (%.1f%%), prefetch wait %.1f ms\n",
++                pred_k_, pred_mode, pst.n_layers, 100.0*pst.overlap/pst.actual, pst.misses, pst.misses ? 100.0*pst.covered/pst.misses : 0.0,
++                pst.pf_reads, pst.pf_used, pst.pf_reads ? 100.0*pst.pf_used/pst.pf_reads : 0.0, pst.pf_wait_ns/1e6);
++        }
+         if (stats_copy.hits > 0) {
+             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+         }
+@@ -1147,6 +1482,24 @@ int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor
+     return pimpl->copy_experts(backend, w, dst, e, last);
+ }
+ 
++void llama_moe_cache::set_pred(int32_t il, ggml_tensor * pred) const {
++    if (il >= 0 && il < (int32_t) pimpl->pred_t.size()) {
++        pimpl->pred_t[il] = pred;
++    }
++}
++
++ggml_tensor * llama_moe_cache::pred_w(int32_t il) const {
++    return il >= 0 && il < (int32_t) pimpl->pw_w.size() ? pimpl->pw_w[il] : nullptr;
++}
++
++ggml_tensor * llama_moe_cache::pred_b(int32_t il) const {
++    return il >= 0 && il < (int32_t) pimpl->pw_b.size() ? pimpl->pw_b[il] : nullptr;
++}
++
++int32_t llama_moe_cache::pred_k() const {
++    return pimpl->async && pimpl->ssd ? pimpl->pred_k_ : 0;
++}
++
+ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, size_t> res;
+     for (const auto & d : pimpl->devices) {
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index edf5ea10b..f70a479f4 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -38,6 +38,15 @@ public:
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
++    // (tq expert cache) LLAMA_MOE_PRED: the graph registers pred, the experts predicted for layer il (I32, contiguous, computed
++    // in the split that selects the experts of layer il - 1); nullptr clears it
++    void set_pred(int32_t il, ggml_tensor * pred) const;
++    int32_t pred_k() const; // 0 if prediction is off
++    // (tq expert cache) LLAMA_MOE_PRED_W=file: learned predictor (linear map from the layer il - 1 FFN input to the layer il router logits);
++    // weight [n_embd, n_expert] F16 and bias [n_expert] F32 on the device, nullptr if none for this layer (the graph then uses the router)
++    ggml_tensor * pred_w(int32_t il) const;
++    ggml_tensor * pred_b(int32_t il) const;
++
+ private:
+     struct impl;
+     std::unique_ptr<impl> pimpl;
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 9beb14841..5ab7a132f 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -341,6 +341,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+ 
+         model->t_start_us = tm.t_start_us;
+ 
++        model->path_given = fname;
+         model->hparams.vocab_only = params.vocab_only;
+         model->hparams.no_alloc   = params.no_alloc;
+ 
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 77430e7af..3328b866b 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "llama-moe-cache.h"
+ #include "llama-impl.h"
+ #include "llama-memory-hybrid-idx.h"
+ #include "llama-memory-recurrent.h"
+@@ -488,6 +489,25 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
+                 model.layers[il].hc_ffn_inject,
+                 &inject, il);
+ 
++        // (tq expert cache) LLAMA_MOE_PRED: predict the experts of layer il + 1 with its router on the FFN input of layer il, in the split
++        // that selects the experts of layer il, so the cache can read them while the GPU runs on
++        if (moe_cache != nullptr && il + 1 < n_layer) {
++            const int32_t k = n_tokens == 1 ? moe_cache->pred_k() : 0;
++            if (k > 0 && model.layers[il + 1].ffn_gate_inp != nullptr) {
++                // the router logits of layer il + 1 (F32, n_expert): the cache picks the experts to read
++                // LLAMA_MOE_PRED_W: a learned map in place of the router of layer il + 1 (changes only which experts are read ahead)
++                ggml_tensor * pw = moe_cache->pred_w(il + 1);
++                ggml_tensor * pl = pw != nullptr ? ggml_add(ctx0, ggml_mul_mat(ctx0, pw, cur), moe_cache->pred_b(il + 1))
++                                                 : build_lora_mm(model.layers[il + 1].ffn_gate_inp, cur);
++                cb(pl, "moe_pred", il + 1);
++                ggml_set_output(pl);
++                ggml_build_forward_expand(gf, pl);
++                moe_cache->set_pred(il + 1, pl);
++            } else {
++                moe_cache->set_pred(il + 1, nullptr);
++            }
++        }
++
+         cur = build_layer_ffn(cur, il);
+         cb(cur, "ffn_out", il);
+ 
+-- 
+2.54.0 (Apple Git-157)
+

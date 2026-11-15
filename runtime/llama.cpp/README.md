@@ -12,12 +12,13 @@ patches.
 | `0004` llama: SSD-backed MoE expert cache | experts stay in the GGUF file; a fixed cache of slots in GPU-visible memory; misses read from the SSD; output numerically equivalent to the normal path (float-level differences, not byte-identical; measured on the 35B, public series); 16 GB-mode accuracy GSM8K 94.0 / HumanEval 92.1 / MBPP 87.6 vs normal path 95.0 / 92.7 / 87.2, no significant difference (exact McNemar); answer wording differs from the normal path on about a quarter of items, while correctness changes on a few | off; `LLAMA_MOE_SSD=1` |
 | `0005` ggml-cpu: repacked kernels for the dense trit types | aarch64 CPU only: the TQ weights (including MoE experts) are repacked at load into a 4-row layout and run on NEON dotprod mat-vec / mat-mat kernels, with i8mm and SME2 mat-mat paths where the CPU has them; numerically equivalent to the 0001 CPU reference (float-level differences, not byte-identical); the repacked weights take more memory than the file (TQ9 +22 %, TQ27 +2.5 %, TQ81 +23 %) | on for aarch64; opt-out `GGML_TQ_NO_REPACK=1`, experts only `GGML_TQ_NO_MOE_REPACK=1`, per type `GGML_TQ_REPACK_MASK`, `GGML_TQ_NO_I8MM=1`, `GGML_TQ_NO_SME=1`, `GGML_TQ_SME_THREADS=n` (default 1) |
 | `0006` ggml-cpu: repack 2-D weights with rows not a multiple of 4 | 0005 refused such tensors and left them on the 0001 scalar reference; they are now repacked with the last group of 4 padded with zero rows and only the real rows written back (MoE 3-D weights still need a multiple of 4). Matters for vocabularies like Qwen3's 151,669 tokens (e.g. Ternary Bonsai 1.7B re-packed with [`tools/`](tools/)), whose output layer runs on every generated token: there, decode ×2.7 on a Neoverse-N1-class CPU path; tensors with rows % 4 == 0 unchanged | on with 0005 |
+| `0007` llama: 16 GB Mac defaults for the expert cache | only with `LLAMA_MOE_SSD=1`: (a) Qwen3.8-Flash-Next (qwen4exp) uses **8 routed experts per token** instead of the model's 10 (measured accuracy-neutral on the TR2.31-G file: GSM8K / HumanEval / MBPP / IFEval, no significant difference; not measured on the TR3-G file); (b) the experts of the next layer are predicted and read from the SSD while the GPU runs, with a GPU keep-busy filler so the GPU does not clock down while it waits; (c) a learned predictor `<model>.trpw` next to the first shard is loaded automatically and used for that read-ahead only (output unchanged; a missing or bad file falls back to the router with a warning); (d) the expert cache gives back the extra attention memory of windows above 4,096 tokens. MacBook Air M5 16 GB, Qwen3.8-Flash-Next TR2.31-G: about 12 tokens/s vs 3.6 for TR3-G on 0001-0006 | on with `LLAMA_MOE_SSD=1`; `LLAMA_MOE_EXPERTS=N` (1, 2, 4, 5, 6, 8, 9, 10; `0` = the model's own), `LLAMA_MOE_PRED=0` (no read-ahead), `LLAMA_MOE_PRED_K` (default 6), `LLAMA_MOE_PRED_W=<file>` (empty = no learned predictor), `GGML_METAL_MOE_SPIN=0` (no filler), `LLAMA_MOE_CACHE_REF_CTX` (default 4096, 0 = off); `--override-kv qwen4exp.expert_used_count=int:N` always wins |
 
 ## Ready-built binaries
 
-No build needed: the [`llama.cpp-tr-b11721-r2` release](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r2) has this series
-(0001-0006 on `ff5a233`; the earlier `llama.cpp-tr-b11721` release has 0001-0005) built for **macOS arm64** (Apple silicon, macOS 13.3+, Metal; CPU code for M1 / M2-M3 / M4+ picked at run time)
-and **Linux arm64** (glibc 2.39+, e.g. Ubuntu 24.04 / DGX OS; CPU only; CPU code for armv8.0 ... armv9.2 + SME picked at run time).
+No build needed: the [`llama.cpp-tr-b11721-r3` release](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r3) has this series
+(0001-0007 on `ff5a233`) built for **macOS arm64** (Apple silicon, macOS 13.3+, Metal; CPU code for M1 / M2-M3 / M4+ picked at run time).
+The [`llama.cpp-tr-b11721-r2` release](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r2) has 0001-0006 for macOS arm64 and **Linux arm64** (glibc 2.39+, e.g. Ubuntu 24.04 / DGX OS; CPU only; CPU code for armv8.0 ... armv9.2 + SME picked at run time).
 Each archive has `llama-server` (with the web UI), `llama-cli`, `llama-completion`, `llama-bench`, `llama-perplexity` and `test-backend-ops`.
 The run lines below work with them as they are (`./llama-server` in the unpacked folder instead of `./build/bin/llama-server`).
 On macOS, an archive downloaded with a web browser needs `xattr -dr com.apple.quarantine <folder>` once. The archives are made by
@@ -61,6 +62,11 @@ cmake --build build -j --target llama-server llama-cli llama-bench llama-perplex
 ./build/bin/llama-server -m Qwen3.6-35B-A3B-TR2.25-G.gguf -c 4096 -fa on --jinja
 # 35B in a 16 GB budget: expert cache of 8,400 MiB (experimental; measured by capping memory on a 128 GB M5 Max, not on a real 16 GB Mac)
 LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB=8400 LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1 GGML_SCHED_COPY_CB_FIRST=1 GGML_TQ_NO_REPACK=1 ./build/bin/llama-server -m Qwen3.6-35B-A3B-TR2.25-G.gguf -c 4096 -fa on --jinja -np 1
+# Qwen3.8-Flash-Next TR2.31-G on a 16 GB Mac (8 shards + the .trpw predictor in one folder; needs 0007). One-line setup instead:
+#   curl -fsSL https://raw.githubusercontent.com/ternii-ai/tritq-vllm/main/mac/qwen38-16gb.sh | bash
+caffeinate -ims env LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB=6750 LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1 GGML_SCHED_COPY_CB_FIRST=1 \
+GGML_METAL_OPT_GDNPREP=1 GGML_METAL_OPT_NGATED=1 GGML_TQ_NO_REPACK=1 \
+./build/bin/llama-server -m Qwen3.8-Flash-Next-TR2.31-G-00001-of-00008.gguf -c 4096 -fa on --jinja -np 1 --cache-ram 0 --reasoning off
 # Qwen3.8-Flash-Next TR3-G (experimental; 10 shards, point -m at the first). Expert cache 35000 (64 GB and up), 13501 (32-48 GB),
 # 6750 (24 GB), 5900 (16 GB); measured by capping memory on a 128 GB M5 Max, not on real smaller Macs. 0003's two fusions are on in every measurement.
 LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB=35000 LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1 GGML_SCHED_COPY_CB_FIRST=1 \
@@ -93,6 +99,11 @@ in the request, or raise `max_tokens`. These switches are standard llama.cpp opt
 
 ## Known limitations
 
+- **0007 changes the expert-cache path for every model that uses it** (`LLAMA_MOE_SSD=1`): the read-ahead and filler run for the 35B
+  too (output unchanged in a 4-prompt check), and the 8-expert default applies to the Qwen3.8-Flash-Next TR3-G file as well, where its
+  accuracy has not been measured: set `LLAMA_MOE_EXPERTS=0` to keep 10 experts there. `LLAMA_MOE_PRED=0 GGML_METAL_MOE_SPIN=0
+  LLAMA_MOE_EXPERTS=0` gives 0004's behaviour back. Run Macs on 0007 under `caffeinate -ims` (or another power assertion): without it the
+  base M5's GPU clocks down and decode is much slower.
 - **CUDA is not supported** by this patch series: the TQ types run on the CPU and on Metal only. The fast CPU path (0005) is aarch64 only; other CPUs (e.g. x86) keep the 0001 scalar reference (not measured on x86; on Arm it was ~10–50× slower than 0005).
 - `test-backend-ops` does not exercise 0005's repacked path (it never places weights in the CPU repack buffer), so a passing CPU run there does not test it.
 - **`LLAMA_MOE_CACHE_MAX_BATCH` defaults to 32 in 0004**, below llama.cpp's default 512-token micro-batch: `LLAMA_MOE_SSD=1` without
