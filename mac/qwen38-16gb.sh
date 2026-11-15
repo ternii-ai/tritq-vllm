@@ -91,11 +91,13 @@ RS=(--reasoning off); [ -n "${TR_THINK:-}" ] && RS=()
 say "Starting the model. Close other large apps first: on a 16 GB Mac it uses about 13 GB."
 say "The first answer takes a little longer while macOS reads the model from the SSD. Press Ctrl-C here to stop."
 cd "$DIR/llama.cpp-tr-macos-arm64"
-caffeinate -ims env LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB="$CACHE" LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1 \
+env LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB="$CACHE" LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1 \
   GGML_SCHED_COPY_CB_FIRST=1 GGML_METAL_OPT_GDNPREP=1 GGML_METAL_OPT_NGATED=1 GGML_TQ_NO_REPACK=1 \
   ./llama-server -m "$DIR/model/$MODEL-00001-of-00008.gguf" -c "$CTX" -fa on --jinja -np 1 --cache-ram 0 "${RS[@]}" \
   --host 127.0.0.1 --port "$PORT" > "$DIR/server.log" 2>&1 &
 SP=$!
+# keep the Mac and its GPU awake while the server runs (without this the GPU clocks down and decode is much slower)
+caffeinate -ims -w $SP &
 trap 'kill $SP 2>/dev/null; wait $SP 2>/dev/null; echo; say "Stopped."; exit 0' INT TERM
 until curl -s -m 2 "http://127.0.0.1:$PORT/health" | grep -q '"ok"'; do
   kill -0 $SP 2>/dev/null || { tail -20 "$DIR/server.log"; die "the server stopped while loading (log: $DIR/server.log)."; }
