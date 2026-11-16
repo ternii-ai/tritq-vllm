@@ -59,6 +59,9 @@ runs at about 12 tokens/s on a MacBook Air M5 with 16 GB. One line in Terminal d
 curl -fsSL https://raw.githubusercontent.com/ternii-ai/tritq-vllm/main/mac/qwen38-16gb.sh | bash
 ```
 
+On bigger Macs the same line uses more memory and all 10 routed experts: a 22,000 MiB expert cache from 48 GB, 35,000 MiB from 64 GB,
+and the whole model in memory from 128 GB.
+
 `Ternii/Qwen3.6-35B-A3B-TR2.25-G-GGUF` runs at about 35 tokens/s on the same Mac (release r3, experts streamed from the SSD; with 24 GB
 or more it runs fully in memory). One line as well:
 

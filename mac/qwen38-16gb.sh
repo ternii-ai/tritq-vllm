@@ -5,14 +5,16 @@
 # Downloads the ready-built llama.cpp-tr and the model (about 90 GB) into ~/qwen38-tr, checks every file's SHA-256,
 # then starts a local chat server and opens it in your browser. Run the same line again to restart; finished downloads are kept,
 # interrupted ones resume. Nothing is installed system-wide and nothing is sent anywhere: the model runs on this Mac only.
-# Options (environment variables): TR_DIR (install folder), TR_PORT (default 8080), TR_CACHE_MIB (expert cache, default 6750),
+# How it runs depends on this Mac's memory: below 48 GB the experts stay on the SSD behind a 6,750 MiB cache and 8 of the 10 routed
+# experts are used per token; 48-63 GB: 22,000 MiB cache, all 10 experts; 64-127 GB: 35,000 MiB cache, all 10 experts;
+# 128 GB and up: the whole model in memory, all 10 experts.
+# Options (environment variables): TR_DIR (install folder), TR_PORT (default 8080), TR_CACHE_MIB (expert cache; forces the SSD mode),
 # TR_CTX (context window, default 4096), TR_THINK=1 (let the model think before answering; slower), TR_NO_START=1 (download only).
 set -euo pipefail
 { # the whole script is one block, so a cut-off download of this file runs nothing
 
 DIR=${TR_DIR:-$HOME/qwen38-tr}
 PORT=${TR_PORT:-8080}
-CACHE=${TR_CACHE_MIB:-6750}
 CTX=${TR_CTX:-4096}
 REL=llama.cpp-tr-b11721-r3
 BIN_URL=https://github.com/ternii-ai/tritq-vllm/releases/download/$REL/llama.cpp-tr-macos-arm64.tar.gz
@@ -88,12 +90,24 @@ done <<< "$FILES"
 # ---- start ----
 if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN > /dev/null 2>&1; then die "port $PORT is in use (another server running?). Stop it, or set TR_PORT."; fi
 RS=(--reasoning off); [ -n "${TR_THINK:-}" ] && RS=()
-say "Starting the model. Close other large apps first: on a 16 GB Mac it uses about 13 GB."
+# memory plan (measured on Apple silicon; wired memory in brackets): <48 GB 6,750 MiB cache, 8 experts (12.9 GB);
+# 48-63 GB 22,000 MiB, 10 experts (32 GB); 64-127 GB 35,000 MiB, 10 experts (46 GB); 128 GB+ whole model in memory, 10 experts
+if [ "$RAM_GB" -ge 128 ] && [ -z "${TR_CACHE_MIB:-}" ]; then
+  MODE=(-fit off)
+  say "Starting the model fully in memory ($RAM_GB GB Mac, all 10 experts). Loading reads about 90 GB from the SSD the first time."
+else
+  if [ "$RAM_GB" -ge 64 ]; then CACHE=35000; XP=(LLAMA_MOE_EXPERTS=0)
+  elif [ "$RAM_GB" -ge 48 ]; then CACHE=22000; XP=(LLAMA_MOE_EXPERTS=0)
+  else CACHE=6750; XP=(); fi
+  CACHE=${TR_CACHE_MIB:-$CACHE}
+  MODE=(); XP+=(LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB="$CACHE" LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1)
+  if [ "$RAM_GB" -ge 48 ]; then say "Starting the model ($RAM_GB GB Mac): experts on the SSD behind a $CACHE MiB cache, all 10 experts."
+  else say "Starting the model. Close other large apps first: on a 16 GB Mac it uses about 13 GB."; fi
+fi
 say "The first answer takes a little longer while macOS reads the model from the SSD. Press Ctrl-C here to stop."
 cd "$DIR/llama.cpp-tr-macos-arm64"
-env LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB="$CACHE" LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1 \
-  GGML_SCHED_COPY_CB_FIRST=1 GGML_METAL_OPT_GDNPREP=1 GGML_METAL_OPT_NGATED=1 GGML_TQ_NO_REPACK=1 \
-  ./llama-server -m "$DIR/model/$MODEL-00001-of-00008.gguf" -c "$CTX" -fa on --jinja -np 1 --cache-ram 0 ${RS[@]+"${RS[@]}"} \
+env ${XP[@]+"${XP[@]}"} GGML_SCHED_COPY_CB_FIRST=1 GGML_METAL_OPT_GDNPREP=1 GGML_METAL_OPT_NGATED=1 GGML_TQ_NO_REPACK=1 \
+  ./llama-server -m "$DIR/model/$MODEL-00001-of-00008.gguf" -c "$CTX" -fa on --jinja -np 1 --cache-ram 0 ${MODE[@]+"${MODE[@]}"} ${RS[@]+"${RS[@]}"} \
   --host 127.0.0.1 --port "$PORT" > "$DIR/server.log" 2>&1 &
 SP=$!
 # keep the Mac and its GPU awake while the server runs (without this the GPU clocks down and decode is much slower)
