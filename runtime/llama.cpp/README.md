@@ -99,8 +99,8 @@ in the request, or raise `max_tokens`. These switches are standard llama.cpp opt
 
 ## Known limitations
 
-- **0007 changes the expert-cache path for every model that uses it** (`LLAMA_MOE_SSD=1`): the read-ahead and filler run for the 35B
-  too (output unchanged in a 4-prompt check), and the 8-expert default applies to the Qwen3.8-Flash-Next TR3-G file as well, where its
+- **0007 changes the expert-cache path for every model that uses it** (`LLAMA_MOE_SSD=1`): the GPU filler runs for the 35B
+  too (output unchanged in a 4-prompt check; the read-ahead itself applies to Qwen3.8-Flash-Next only), and the 8-expert default applies to the Qwen3.8-Flash-Next TR3-G file as well, where its
   accuracy has not been measured: set `LLAMA_MOE_EXPERTS=0` to keep 10 experts there. `LLAMA_MOE_PRED=0 GGML_METAL_MOE_SPIN=0
   LLAMA_MOE_EXPERTS=0` gives 0004's behaviour back. Run Macs on 0007 under `caffeinate -ims` (or another power assertion): without it the
   base M5's GPU clocks down and decode is much slower.
