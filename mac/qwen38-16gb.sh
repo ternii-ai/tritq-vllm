@@ -93,7 +93,7 @@ say "The first answer takes a little longer while macOS reads the model from the
 cd "$DIR/llama.cpp-tr-macos-arm64"
 env LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB="$CACHE" LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1 \
   GGML_SCHED_COPY_CB_FIRST=1 GGML_METAL_OPT_GDNPREP=1 GGML_METAL_OPT_NGATED=1 GGML_TQ_NO_REPACK=1 \
-  ./llama-server -m "$DIR/model/$MODEL-00001-of-00008.gguf" -c "$CTX" -fa on --jinja -np 1 --cache-ram 0 "${RS[@]}" \
+  ./llama-server -m "$DIR/model/$MODEL-00001-of-00008.gguf" -c "$CTX" -fa on --jinja -np 1 --cache-ram 0 ${RS[@]+"${RS[@]}"} \
   --host 127.0.0.1 --port "$PORT" > "$DIR/server.log" 2>&1 &
 SP=$!
 # keep the Mac and its GPU awake while the server runs (without this the GPU clocks down and decode is much slower)

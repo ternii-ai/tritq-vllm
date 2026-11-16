@@ -60,8 +60,9 @@ cmake --build build -j --target llama-server llama-cli llama-bench llama-perplex
 ```bash
 # 35B, fully in memory (Macs with >= 24 GB; 32 GB comfortable)
 ./build/bin/llama-server -m Qwen3.6-35B-A3B-TR2.25-G.gguf -c 4096 -fa on --jinja
-# 35B in a 16 GB budget: expert cache of 8,400 MiB (experimental; measured by capping memory on a 128 GB M5 Max, not on a real 16 GB Mac)
-LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB=8400 LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1 GGML_SCHED_COPY_CB_FIRST=1 GGML_TQ_NO_REPACK=1 ./build/bin/llama-server -m Qwen3.6-35B-A3B-TR2.25-G.gguf -c 4096 -fa on --jinja -np 1
+# 35B on a 16 GB Mac: expert cache of 8,400 MiB (experimental; ~35 tok/s on a MacBook Air M5 16 GB with r3). One-line setup instead:
+#   curl -fsSL https://raw.githubusercontent.com/ternii-ai/tritq-vllm/main/mac/qwen36-35b.sh | bash
+caffeinate -ims env LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB=8400 LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1 GGML_SCHED_COPY_CB_FIRST=1 ./build/bin/llama-server -m Qwen3.6-35B-A3B-TR2.25-G.gguf -c 4096 -fa on --jinja -np 1
 # Qwen3.8-Flash-Next TR2.31-G on a 16 GB Mac (8 shards + the .trpw predictor in one folder; needs 0007). One-line setup instead:
 #   curl -fsSL https://raw.githubusercontent.com/ternii-ai/tritq-vllm/main/mac/qwen38-16gb.sh | bash
 caffeinate -ims env LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB=6750 LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1 GGML_SCHED_COPY_CB_FIRST=1 \

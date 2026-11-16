@@ -59,6 +59,13 @@ runs at about 12 tokens/s on a MacBook Air M5 with 16 GB. One line in Terminal d
 curl -fsSL https://raw.githubusercontent.com/ternii-ai/tritq-vllm/main/mac/qwen38-16gb.sh | bash
 ```
 
+`Ternii/Qwen3.6-35B-A3B-TR2.25-G-GGUF` runs at about 35 tokens/s on the same Mac (release r3, experts streamed from the SSD; with 24 GB
+or more it runs fully in memory). One line as well:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ternii-ai/tritq-vllm/main/mac/qwen36-35b.sh | bash
+```
+
 The Mac file for this model (`Ternii/Qwen3.8-Flash-Next-TR3-G-GGUF`) is **experimental** and a different file (every translated weight
 at 3 trits); the comparisons above do not apply to it.
 
@@ -67,7 +74,7 @@ at 3 trits); the comparisons above do not apply to it.
 | model | runtime |
 |---|---|
 | [Ternii/Qwen3.6-35B-A3B-TR2.25-G](https://huggingface.co/Ternii/Qwen3.6-35B-A3B-TR2.25-G) | vLLM, `ghcr.io/ternii-ai/tritq-qwen36:0.2` |
-| [Ternii/Qwen3.6-35B-A3B-TR2.25-G-GGUF](https://huggingface.co/Ternii/Qwen3.6-35B-A3B-TR2.25-G-GGUF) | llama.cpp (Mac) |
+| [Ternii/Qwen3.6-35B-A3B-TR2.25-G-GGUF](https://huggingface.co/Ternii/Qwen3.6-35B-A3B-TR2.25-G-GGUF) | llama.cpp (Mac), 16 GB Macs and up (one-line setup: [`mac/qwen36-35b.sh`](mac/qwen36-35b.sh)) |
 | [Ternii/Qwen3.8-Flash-Next-TR2.57-G](https://huggingface.co/Ternii/Qwen3.8-Flash-Next-TR2.57-G) | vLLM, `ghcr.io/ternii-ai/tritq-qwen38:0.3` |
 | [Ternii/Qwen3.8-Flash-Next-TR3-G-GGUF](https://huggingface.co/Ternii/Qwen3.8-Flash-Next-TR3-G-GGUF) | llama.cpp (Mac), experimental |
 | [Ternii/Qwen3.8-Flash-Next-TR2.31-G-GGUF](https://huggingface.co/Ternii/Qwen3.8-Flash-Next-TR2.31-G-GGUF) | llama.cpp (Mac), **16 GB Macs** (one-line setup: [`mac/qwen38-16gb.sh`](mac/qwen38-16gb.sh)) |
