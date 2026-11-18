@@ -7,7 +7,8 @@
 # interrupted ones resume. Nothing is installed system-wide and nothing is sent anywhere: the model runs on this Mac only.
 # On a Mac with less than 24 GB the experts stay on the SSD behind an expert cache; with 24 GB or more the model runs fully in memory.
 # Options (environment variables): TR_DIR (install folder), TR_PORT (default 8080), TR_CACHE_MIB (expert cache below 24 GB, default 8400),
-# TR_CTX (context window, default 4096), TR_THINK=1 (let the model think before answering; slower), TR_NO_START=1 (download only).
+# TR_CTX (context window, default 4096), TR_THINK=1 (let the model think before answering; slower), TR_NO_START=1 (download only),
+# TR_NGRAM=0 (turn off n-gram drafting, which is on by default: it speeds up answers that repeat text from the prompt, such as code edits).
 set -euo pipefail
 { # the whole script is one block, so a cut-off download of this file runs nothing
 
@@ -81,6 +82,9 @@ done <<< "$FILES"
 # ---- start ----
 if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN > /dev/null 2>&1; then die "port $PORT is in use (another server running?). Stop it, or set TR_PORT."; fi
 RS=(--reasoning off); [ -n "${TR_THINK:-}" ] && RS=()
+# n-gram drafting: guesses the next tokens from text already in the conversation and has the model check them in one batch
+# (measured: about 1.5x on code edits with the whole model in memory, +35 % on a 16 GB MacBook Air, no change on new text)
+NG=(--spec-type ngram-mod); [ "${TR_NGRAM:-1}" = 0 ] && NG=()
 if [ "$RAM_GB" -lt 24 ]; then
   MOE=(LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB="$CACHE" LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1 GGML_SCHED_COPY_CB_FIRST=1)
   say "Starting the model with the experts on the SSD ($RAM_GB GB Mac). Close other large apps first: it uses about 12 GB."
@@ -90,7 +94,7 @@ fi
 say "The first answer takes a little longer while macOS reads the model from the SSD. Press Ctrl-C here to stop."
 cd "$DIR/llama.cpp-tr-macos-arm64"
 env ${MOE[@]+"${MOE[@]}"} \
-  ./llama-server -m "$DIR/model/$MODEL.gguf" -c "$CTX" -fa on --jinja -np 1 ${RS[@]+"${RS[@]}"} \
+  ./llama-server -m "$DIR/model/$MODEL.gguf" -c "$CTX" -fa on --jinja -np 1 ${RS[@]+"${RS[@]}"} ${NG[@]+"${NG[@]}"} \
   --host 127.0.0.1 --port "$PORT" > "$DIR/server.log" 2>&1 &
 SP=$!
 # keep the Mac and its GPU awake while the server runs (without this the GPU clocks down and decode is much slower)

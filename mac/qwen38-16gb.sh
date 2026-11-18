@@ -96,6 +96,9 @@ RS=(--reasoning off); [ -n "${TR_THINK:-}" ] && RS=()
 NG=(--spec-type ngram-mod); [ "${TR_NGRAM:-1}" = 0 ] && NG=()
 # memory plan (measured on Apple silicon; wired memory in brackets): <48 GB 6,750 MiB cache, 8 experts (12.9 GB);
 # 48-63 GB 22,000 MiB, 10 experts (32 GB); 64-127 GB 35,000 MiB, 10 experts (46 GB); 128 GB+ whole model in memory, 10 experts
+# prefill in batches of 2,048 tokens on 48 GB and up (measured: long prompts read +23-36 % faster in memory, +14-74 % in the cache modes);
+# kept at 512 below 48 GB, where it would take about 0.6 GB more memory
+PF=(); PE=(); [ "$RAM_GB" -ge 48 ] && { PF=(-ub 2048 -b 2048); PE=(GGML_METAL_TQD_MM=1); }
 if [ "$RAM_GB" -ge 128 ] && [ -z "${TR_CACHE_MIB:-}" ]; then
   MODE=(-fit off)
   say "Starting the model fully in memory ($RAM_GB GB Mac, all 10 experts). Loading reads about 90 GB from the SSD the first time."
@@ -104,14 +107,15 @@ else
   elif [ "$RAM_GB" -ge 48 ]; then CACHE=22000; XP=(LLAMA_MOE_EXPERTS=0)
   else CACHE=6750; XP=(); fi
   CACHE=${TR_CACHE_MIB:-$CACHE}
-  MODE=(); XP+=(LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB="$CACHE" LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1)
+  MB=512; [ "$RAM_GB" -ge 48 ] && MB=2048   # the expert cache must take a whole prefill batch
+  MODE=(); XP+=(LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB="$CACHE" LLAMA_MOE_CACHE_MAX_BATCH=$MB LLAMA_MOE_ASYNC=1)
   if [ "$RAM_GB" -ge 48 ]; then say "Starting the model ($RAM_GB GB Mac): experts on the SSD behind a $CACHE MiB cache, all 10 experts."
   else say "Starting the model. Close other large apps first: on a 16 GB Mac it uses about 13 GB."; fi
 fi
 say "The first answer takes a little longer while macOS reads the model from the SSD. Press Ctrl-C here to stop."
 cd "$DIR/llama.cpp-tr-macos-arm64"
-env ${XP[@]+"${XP[@]}"} GGML_SCHED_COPY_CB_FIRST=1 GGML_METAL_OPT_GDNPREP=1 GGML_METAL_OPT_NGATED=1 GGML_TQ_NO_REPACK=1 \
-  ./llama-server -m "$DIR/model/$MODEL-00001-of-00008.gguf" -c "$CTX" -fa on --jinja -np 1 --cache-ram 0 ${MODE[@]+"${MODE[@]}"} ${RS[@]+"${RS[@]}"} ${NG[@]+"${NG[@]}"} \
+env ${XP[@]+"${XP[@]}"} ${PE[@]+"${PE[@]}"} GGML_SCHED_COPY_CB_FIRST=1 GGML_METAL_OPT_GDNPREP=1 GGML_METAL_OPT_NGATED=1 GGML_TQ_NO_REPACK=1 \
+  ./llama-server -m "$DIR/model/$MODEL-00001-of-00008.gguf" -c "$CTX" -fa on --jinja -np 1 --cache-ram 0 ${MODE[@]+"${MODE[@]}"} ${RS[@]+"${RS[@]}"} ${NG[@]+"${NG[@]}"} ${PF[@]+"${PF[@]}"} \
   --host 127.0.0.1 --port "$PORT" > "$DIR/server.log" 2>&1 &
 SP=$!
 # keep the Mac and its GPU awake while the server runs (without this the GPU clocks down and decode is much slower)
