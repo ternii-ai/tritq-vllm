@@ -5,18 +5,19 @@
 # Downloads the ready-built llama.cpp-tr and the model (about 90 GB) into ~/qwen38-tr, checks every file's SHA-256,
 # then starts a local chat server and opens it in your browser. Run the same line again to restart; finished downloads are kept,
 # interrupted ones resume. Nothing is installed system-wide and nothing is sent anywhere: the model runs on this Mac only.
-# How it runs depends on this Mac's memory: below 48 GB the experts stay on the SSD behind a 6,750 MiB cache and 8 of the 10 routed
-# experts are used per token; 48-63 GB: 22,000 MiB cache, all 10 experts; 64-127 GB: 35,000 MiB cache, all 10 experts;
+# How it runs depends on this Mac's memory: below 48 GB the experts stay on the SSD behind a cache of about 6,600 MiB (smaller for
+# contexts above 32k) and 8 of the 10 routed experts are used per token; 48-63 GB: 22,000 MiB cache, all 10 experts;
+# 64-127 GB: 35,000 MiB cache, all 10 experts;
 # 128 GB and up: the whole model in memory, all 10 experts.
 # Options (environment variables): TR_DIR (install folder), TR_PORT (default 8080), TR_CACHE_MIB (expert cache; forces the SSD mode),
-# TR_CTX (context window, default 4096), TR_THINK=1 (let the model think before answering; slower), TR_NO_START=1 (download only),
+# TR_CTX (context window, default 32768; up to 262144), TR_THINK=1 (let the model think before answering; slower), TR_NO_START=1 (download only),
 # TR_NGRAM=0 (turn off n-gram drafting, which is on by default: it speeds up answers that repeat text from the prompt, such as code edits).
 set -euo pipefail
 { # the whole script is one block, so a cut-off download of this file runs nothing
 
 DIR=${TR_DIR:-$HOME/qwen38-tr}
 PORT=${TR_PORT:-8080}
-CTX=${TR_CTX:-4096}
+CTX=${TR_CTX:-32768}
 REL=llama.cpp-tr-b11721-r3
 BIN_URL=https://github.com/ternii-ai/tritq-vllm/releases/download/$REL/llama.cpp-tr-macos-arm64.tar.gz
 BIN_SHA=64f2a57f1b7f7d16c65b30358a21daec0cc019c44ba734913cbcf29ba04777c1
@@ -94,20 +95,28 @@ RS=(--reasoning off); [ -n "${TR_THINK:-}" ] && RS=()
 # n-gram drafting: guesses the next tokens from text already in the conversation and has the model check them in one batch
 # (measured: about 2x on code edits with the whole model in memory, +19 % on a 16 GB MacBook Air, no change on new text)
 NG=(--spec-type ngram-mod); [ "${TR_NGRAM:-1}" = 0 ] && NG=()
-# memory plan (measured on Apple silicon; wired memory in brackets): <48 GB 6,750 MiB cache, 8 experts (12.9 GB);
+# memory plan (measured on Apple silicon; wired memory in brackets): <48 GB 6,600 MiB cache at 32k, 8 experts (13.4 GB);
 # 48-63 GB 22,000 MiB, 10 experts (32 GB); 64-127 GB 35,000 MiB, 10 experts (46 GB); 128 GB+ whole model in memory, 10 experts
 # prefill in batches of 2,048 tokens on 48 GB and up (measured: long prompts read +23-36 % faster in memory, +14-74 % in the cache modes);
-# kept at 512 below 48 GB, where it would take about 0.6 GB more memory
-PF=(); PE=(); [ "$RAM_GB" -ge 48 ] && { PF=(-ub 2048 -b 2048); PE=(GGML_METAL_TQD_MM=1); }
+# below 48 GB too (measured on a 16 GB MacBook Air: +69 % at 3k tokens, +75 % at 9-23k, same answers as batches of 512), with the
+# expert cache made smaller as the context grows, so that every layer stays on the GPU (otherwise llama.cpp moves one to the CPU,
+# which changes answers and slows decoding); above a 128k context batches stay at 512
+PF=(-ub 2048 -b 2048); PE=(GGML_METAL_TQD_MM=1); MB=2048
 if [ "$RAM_GB" -ge 128 ] && [ -z "${TR_CACHE_MIB:-}" ]; then
   MODE=(-fit off)
   say "Starting the model fully in memory ($RAM_GB GB Mac, all 10 experts). Loading reads about 90 GB from the SSD the first time."
 else
   if [ "$RAM_GB" -ge 64 ]; then CACHE=35000; XP=(LLAMA_MOE_EXPERTS=0)
   elif [ "$RAM_GB" -ge 48 ]; then CACHE=22000; XP=(LLAMA_MOE_EXPERTS=0)
-  else CACHE=6750; XP=(); fi
-  CACHE=${TR_CACHE_MIB:-$CACHE}
-  MB=512; [ "$RAM_GB" -ge 48 ] && MB=2048   # the expert cache must take a whole prefill batch
+  else XP=()
+    # 16 GB plan (MiB): GPU memory = 3,059 model + cache + context + prefill buffers, kept within 10,987 (llama.cpp's own fit target)
+    if   [ "$CTX" -le 4096 ];   then CACHE=6700
+    elif [ "$CTX" -le 32768 ];  then CACHE=6600
+    elif [ "$CTX" -le 65536 ];  then CACHE=5950
+    elif [ "$CTX" -le 131072 ]; then CACHE=4750
+    else CACHE=3400; PF=(-ub 512 -b 512); PE=(); MB=512; fi
+  fi
+  CACHE=${TR_CACHE_MIB:-$CACHE}   # the expert cache must take a whole prefill batch (MB)
   MODE=(); XP+=(LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB="$CACHE" LLAMA_MOE_CACHE_MAX_BATCH=$MB LLAMA_MOE_ASYNC=1)
   if [ "$RAM_GB" -ge 48 ]; then say "Starting the model ($RAM_GB GB Mac): experts on the SSD behind a $CACHE MiB cache, all 10 experts."
   else say "Starting the model. Close other large apps first: on a 16 GB Mac it uses about 13 GB."; fi
