@@ -1,12 +1,13 @@
 llama.cpp with the TR Quantisation dense trit types (TQ9_128 / TQ27_128 / TQ81_128)
 
-Ready-built binaries of upstream llama.cpp ff5a233 + patches 0001-0006 from
+Ready-built binaries of upstream llama.cpp ff5a233 + patches 0001-0011 from
 github.com/ternii-ai/tritq-vllm (runtime/llama.cpp). They load the GGUF files of the TR models
 (e.g. huggingface.co/Ternii/Qwen3.6-35B-A3B-TR2.25-G-GGUF), which stock llama.cpp, Ollama and LM Studio cannot.
 
   macOS arm64 (Apple silicon, macOS 13.3+): Metal; CPU code picked at run time for M1 / M2-M3 / M4 and later.
-  Linux arm64 (glibc 2.39+, e.g. Ubuntu 24.04, DGX OS): CPU only; CPU code picked at run time
-    (armv8.0 ... armv9.2 + SME). No CUDA: the TQ types are not supported on CUDA by this series.
+  Linux arm64 (glibc 2.39+, e.g. Ubuntu 24.04, DGX OS): CPU code picked at run time (armv8.0 ... armv9.2 + SME),
+    plus CUDA for the DGX Spark (GB10, sm_121; needs the CUDA 13 runtime, as on DGX OS; tested there only).
+    Without a GPU or the CUDA runtime it runs on the CPU.
 
 Quick start
   ./llama-server -m Qwen3.6-35B-A3B-TR2.25-G.gguf -c 4096 -fa on --jinja --reasoning off

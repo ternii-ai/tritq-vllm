@@ -1,0 +1,217 @@
+From 76f15ab0eda58076f8d0aaef8c84afb8597f2fee Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 11:18:42 +0000
+Subject: [PATCH] ggml-metal: multi-token kernel for the dense trit types (2-8
+ rows, default on)
+
+Mat-vec for 2 to 8 token rows on TQ9_128 / TQ27_128 / TQ81_128: each weight
+word is decoded once for all rows. Output equals the stock mat-vec bit for bit;
+the mat-mat threshold is unchanged. GGML_METAL_TQD_EXT=0 turns it off.
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  34 +++++++
+ ggml/src/ggml-metal/ggml-metal-device.h   |   1 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |   9 +-
+ ggml/src/ggml-metal/kernels/mul_mv.metal  | 113 ++++++++++++++++++++++
+ 4 files changed, 156 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 4c37f4c02..f4d6069cc 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1597,6 +1597,40 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
+     return res;
+ }
+ 
++// (TR multi-token) dense-trit mat-vec over NT src1 rows per threadgroup (kernels/mul_mv.metal)
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext_tqd(ggml_metal_library_t lib, const ggml_tensor * op, int nt) {
++    char base[256];
++    char name[256];
++
++    const int nsg = N_SG_TQD;
++    const int nr0 = N_R0_TQD;
++
++    snprintf(base, 256, "kernel_mul_mv_ext_tqd_%s_f32_nt%d", ggml_type_name(op->src[0]->type), nt);
++    snprintf(name, 256, "%s_nsg=%d", base, nsg);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        ggml_metal_cv_t cv = ggml_metal_cv_init();
++
++        ggml_metal_cv_set_int16(cv, nsg, FC_MUL_MV + 0);
++        ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 2);
++        ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 3);
++        ggml_metal_cv_set_int16(cv, 1,   FC_MUL_MV + 4);
++        ggml_metal_cv_set_bool (cv, false, FC_MUL_MV + 5);
++
++        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
++
++        ggml_metal_cv_free(cv);
++    }
++
++    res.nr0  = nr0;
++    res.nr1  = nt;
++    res.nsg  = nsg;
++    res.smem = 0;
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax(ggml_metal_library_t lib, const ggml_tensor * op) {
+     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+     GGML_ASSERT(ggml_is_contiguous_1(op->src[0]));
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 17a1d11a2..e6fcd5e9d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -150,6 +150,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_amax_part(ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext_tqd   (ggml_metal_library_t lib, const struct ggml_tensor * op, int nt);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge     (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 5f97dee4a..5d37830bf 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2611,7 +2611,14 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
+     const int16_t r2 = ne12/ne02;
+     const int16_t r3 = ne13/ne03;
+ 
+-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
++    // (TR multi-token) dense-trit weights at 2-8 rows decode each word once for NT rows (bit-exact vs the stock mat-vec); on by default, GGML_METAL_TQD_EXT=0 turns it off
++    static const bool tqd_ext = [] { const char * e = getenv("GGML_METAL_TQD_EXT"); return !e || atoi(e) != 0; }();
++    const ggml_type t0 = op->src[0]->type;
++    const bool use_ext = tqd_ext && ne11 >= 2 && ne11 <= 8 && op->src[1]->type == GGML_TYPE_F32 &&
++        (t0 == GGML_TYPE_TQ9_128 || t0 == GGML_TYPE_TQ27_128 || t0 == GGML_TYPE_TQ81_128);
++    static const int nt_of[9] = {1, 1, 2, 3, 4, 3, 3, 4, 4};
++
++    auto pipeline = use_ext ? ggml_metal_library_get_pipeline_mul_mv_ext_tqd(lib, op, nt_of[ne11]) : ggml_metal_library_get_pipeline_mul_mv(lib, op);
+ 
+     const int nr0 = pipeline.nr0;
+     const int nr1 = pipeline.nr1;
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 7c91813f5..067a5a214 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -3534,3 +3534,116 @@ template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t
+ template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
+ template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
+ template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;
++
++// (TR multi-token) dense-trit mat-vec over NT src1 rows per threadgroup: each weight word is decoded once and
++// applied to NT tokens. Per token the arithmetic and summation order equal kernel_mul_mv_tqd_f32_impl, so each
++// output equals the stock kernel's bit for bit. Used for 2-8 rows (on by default; GGML_METAL_TQD_EXT=0 turns it off).
++template<typename block_t, int NLEV, int WB, int nr0, int NT>
++kernel void kernel_mul_mv_ext_tqd(
++        constant ggml_metal_kargs_mul_mv & args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++    const short NSG = FC_mul_mv_nsg;
++
++    const int nb = args.ne00/QK_TQD;
++
++    const int r0 = tgpig.x;
++    const int r1 = tgpig.y*NT;
++    const int im = tgpig.z;
++
++    const int first_row = (r0 * NSG + sgitg) * nr0;
++
++    const uint i12 = im%args.ne12;
++    const uint i13 = im/args.ne12;
++
++    device const float * y[NT];
++    FOR_UNROLL (short q = 0; q < NT; ++q) {
++        const int rq = min(r1 + q, args.ne11 - 1);
++        y[q] = (device const float *) (src1 + (uint64_t)rq*args.nb11 + (uint64_t)i12*args.nb12 + (uint64_t)i13*args.nb13);
++    }
++
++    device const block_t * ax[nr0];
++    for (int row = 0; row < nr0; ++row) {
++        const int rr = min(first_row + row, args.ne01 - 1);
++        const uint64_t offset0 = rr*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
++        ax[row] = (device const block_t *) ((device char *) src0 + offset0);
++    }
++
++    const float off  = float((NLEV - 1)/2);
++    const uint  mask = WB < 32 ? ((1u << (WB & 31)) - 1u) : 0xFFFFFFFFu;
++
++    constexpr short WPL = TQD_WPL;
++    constexpr short GPB = TQD_NW/WPL;
++    const int ng = nb*GPB;
++
++    float sumf[nr0][NT];
++    FOR_UNROLL (short row = 0; row < nr0; ++row) {
++        FOR_UNROLL (short q = 0; q < NT; ++q) { sumf[row][q] = 0.f; }
++    }
++
++    for (int g = tiisg; g < ng; g += N_SIMDWIDTH) {
++        const int   ib = g / GPB;
++        const short w0 = (g - ib*GPB)*WPL;
++
++        float yv[NT][WPL][5];
++        float sy[NT];
++        FOR_UNROLL (short q = 0; q < NT; ++q) {
++            device const float * yb = y[q] + ib*QK_TQD + w0;
++            float s_ = 0.f;
++            FOR_UNROLL (short kk = 0; kk < WPL; ++kk) {
++                FOR_UNROLL (short i = 0; i < 4; ++i) { yv[q][kk][i] = yb[kk + i*TQD_NW]; }
++                yv[q][kk][4] = (w0 + kk) < QK_TQD - 4*TQD_NW ? yb[kk + 4*TQD_NW] : 0.f;
++                s_ += yv[q][kk][0] + yv[q][kk][1] + yv[q][kk][2] + yv[q][kk][3] + yv[q][kk][4];
++            }
++            sy[q] = s_*off;
++        }
++
++        FOR_UNROLL (short row = 0; row < nr0; ++row) {
++            device const block_t * xb = ax[row] + ib;
++            float acc[NT];
++            FOR_UNROLL (short q = 0; q < NT; ++q) { acc[q] = 0.f; }
++            uint tw[2];
++            tqd_word2(xb, w0, tw[0], tw[1]);
++            FOR_UNROLL (short kk = 0; kk < WPL; ++kk) {
++                uint t = tw[kk];
++                FOR_UNROLL (short i = 0; i < 5; ++i) {
++                    uint u;
++                    if (WB < 32) {
++                        t *= uint(NLEV);
++                        u  = t >> (WB & 31);
++                        t &= mask;
++                    } else {
++                        u  = mulhi(t, uint(NLEV));
++                        t *= uint(NLEV);
++                    }
++                    const float fu = float(u);
++                    FOR_UNROLL (short q = 0; q < NT; ++q) { acc[q] += fu*yv[q][kk][i]; }
++                }
++            }
++            const float d = float(xb->d);
++            FOR_UNROLL (short q = 0; q < NT; ++q) { sumf[row][q] += (acc[q] - sy[q])*d; }
++        }
++    }
++
++    FOR_UNROLL (short q = 0; q < NT; ++q) {
++        if (r1 + q < args.ne11) {
++            device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)(r1 + q)*args.ne0;
++            for (int row = 0; row < nr0; ++row) {
++                const float tot = simd_sum(sumf[row][q]);
++                if (tiisg == 0 && first_row + row < args.ne01) {
++                    dst_f32[first_row + row] = tot;
++                }
++            }
++        }
++    }
++}
++
++#define TQD_EXT_INST(T, NL, WB, NT) \
++template [[host_name("kernel_mul_mv_ext_tqd_" #T "_f32_nt" #NT)]] kernel decltype(kernel_mul_mv_ext_tqd<block_##T, NL, WB, N_R0_TQD, NT>) kernel_mul_mv_ext_tqd<block_##T, NL, WB, N_R0_TQD, NT>;
++TQD_EXT_INST(tq9_128,   9, 16, 2) TQD_EXT_INST(tq9_128,   9, 16, 3) TQD_EXT_INST(tq9_128,   9, 16, 4)
++TQD_EXT_INST(tq27_128, 27, 24, 2) TQD_EXT_INST(tq27_128, 27, 24, 3) TQD_EXT_INST(tq27_128, 27, 24, 4)
++TQD_EXT_INST(tq81_128, 81, 32, 2) TQD_EXT_INST(tq81_128, 81, 32, 3) TQD_EXT_INST(tq81_128, 81, 32, 4)
+-- 
+2.54.0 (Apple Git-157)
+

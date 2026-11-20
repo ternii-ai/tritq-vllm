@@ -1,0 +1,748 @@
+From 5c78458f52a468700e3e523cd4deaadc60a184f6 Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 08:26:22 +0000
+Subject: [PATCH] ggml-cuda: multi-token paths for the dense trit types (TQ_MT
+ and TQ_MM, default on)
+
+GGML_CUDA_TQ_MT (default on): grouped MoE mat-vec for 2-8 tokens without
+host syncs; exact against the single-token kernel on MoE layers. Dense
+layers above 8 columns stay on cuBLAS unless GGML_CUDA_TQ_MT_DENSE=1.
+GGML_CUDA_TQ_MM (default on): tensor-core mat-mat for the dense trit types.
+Value-changing: outputs differ from GGML_CUDA_TQ_MM=0. Set =0 to turn off.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  18 +
+ ggml/src/ggml-cuda/tq.cu        | 627 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/tq.cuh       |  11 +
+ tests/test-backend-ops.cpp      |  14 +
+ 4 files changed, 670 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 96258c6f0..491f03942 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1973,6 +1973,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+ 
+     // dense trit types: own decode mat-vec for <= 8 columns, otherwise dequantize + cuBLAS (no MMVQ / MMQ kernels)
+     if (ggml_cuda_type_is_tq(src0->type)) {
++        // (TR multi-token) GGML_CUDA_TQ_MT (default 1): > 8 columns on the exact chunked mat-vec instead of dequantize + cuBLAS
++        // (TR multi-token) GGML_CUDA_TQ_MM (default 1 since v3; 0 = off): tensor-core mat-mat from GGML_CUDA_TQ_MM_MIN columns (not bit-exact)
++        if (ggml_cuda_tq_mul_mat_mm(ctx, src0, src1, nullptr, dst)) {
++            return;
++        }
++        if (ggml_cuda_tq_mul_mat_mt(ctx, src0, src1, nullptr, dst)) {
++            return;
++        }
+         if (!ggml_cuda_tq_mul_mat_vec(ctx, src0, src1, nullptr, dst)) {
+             ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+         }
+@@ -2028,6 +2036,9 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+     }
+ 
+     if (ggml_cuda_type_is_tq(src0->type)) {
++        if (ggml_cuda_tq_mm_supports(src0, src1, dst->src[2], dst) || ggml_cuda_tq_mt_supports(src0, src1, dst->src[2], dst)) {
++            return false;
++        }
+         return dst->ne[2] > TQ_MMV_MAX_COLS;
+     }
+ 
+@@ -2068,6 +2079,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+         if (ggml_cuda_type_is_tq(src0->type)) {
++            // (TR multi-token) GGML_CUDA_TQ_MT (default 1): experts grouped on the device, any token count, no host sync
++            if (ggml_cuda_tq_mul_mat_mm(ctx, src0, src1, ids, dst)) {
++                return;
++            }
++            if (ggml_cuda_tq_mul_mat_mt(ctx, src0, src1, ids, dst)) {
++                return;
++            }
+             if (ne2 <= TQ_MMV_MAX_COLS && ggml_cuda_tq_mul_mat_vec(ctx, src0, src1, ids, dst)) {
+                 return;
+             }
+diff --git a/ggml/src/ggml-cuda/tq.cu b/ggml/src/ggml-cuda/tq.cu
+index ab83f1bca..d85ae2406 100644
+--- a/ggml/src/ggml-cuda/tq.cu
++++ b/ggml/src/ggml-cuda/tq.cu
+@@ -1,4 +1,5 @@
+ #include "tq.cuh"
++#include "mmid.cuh"
+ 
+ // Decode mat-vec for the dense trit types. One warp per output row; the row's nb*26 (block, word) units are spread
+ // over the 32 lanes. A unit decodes its word's 5 digits = weights w, w+26, w+52, w+78, w+104 of its block (the last
+@@ -552,3 +553,629 @@ bool ggml_cuda_tq_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor
+     CUDA_CHECK(cudaGetLastError());
+     return true;
+ }
++
++// ---------------------------------------------------------------------------------------------------------------------
++// (TR multi-token, GGML_CUDA_TQ_MT, default ON since v2; GGML_CUDA_TQ_MT=0 turns it off) exact multi-token paths for verifying a draft (2-65 tokens per pass).
++//
++// (1) MoE: the stock path runs one (token, slot) pair per CTA row-group at <= 8 tokens, so every token re-decodes its
++//     expert's trits, and above 8 tokens it falls back to the host-synchronising per-expert loop (2 stream syncs per
++//     MUL_MAT_ID and no CUDA graph for the whole forward pass). Here the (token, slot) pairs are sorted by expert on
++//     the device (mm_ids_helper, as MMQ does), and one warp decodes each weight word of its expert row once and applies
++//     it to up to TQ_MT_MAXC of the expert's tokens at a time. No host sync, so the pass stays in one CUDA graph.
++// (2) Dense: above 8 columns the stock path dequantises the whole matrix to fp16 and calls cuBLAS. Here the v1 mat-vec
++//     is extended to any column count in chunks of TQ_MT_MAXC columns (each word decoded once per chunk).
++// Per column the arithmetic is exactly that of tq_mmv_kernel (v1, the default): same lane split of the (block, word)
++// units, same fmaf order within a unit, same per-unit key scaling and the same warp reduction, so every output equals
++// the stock 1-8-column result bit for bit (and the batch-1 result for that token).
++
++#define TQ_MT_MAXC 8
++
++// R rows per warp share each activation load; per (row, column) the fmaf sequence is that of tq_mmv_kernel v1.
++template <ggml_type type, int nc, int R>
++static __device__ __forceinline__ void tq_mt_cols(const typename tq_traits<type>::block * const * wr, const int64_t row0,
++        const int64_t nrows, const float * const * xs, float * const * ys, const int nunits, const int lane) {
++    typedef tq_traits<type> tr;
++    typedef typename tr::block block;
++    constexpr int N = tr::N, W = tr::W;
++
++    float acc[R][nc];
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++#pragma unroll
++        for (int c = 0; c < nc; ++c) {
++            acc[r][c] = 0.0f;
++        }
++    }
++
++#pragma unroll 2
++    for (int u = lane; u < nunits; u += WARP_SIZE) {
++        const int b = u / TQD_NW;
++        const int w = u - b*TQD_NW;
++        const int xo = b*QK_TQD + w;
++        float xv[5][nc];
++#pragma unroll
++        for (int i = 0; i < 5; ++i) {
++#pragma unroll
++            for (int c = 0; c < nc; ++c) {
++                xv[i][c] = (i < 4 || w < QK_TQD - 4*TQD_NW) ? __ldg(xs[c] + xo + i*TQD_NW) : 0.0f;
++            }
++        }
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            const block & blk = wr[r][b];
++            const float d = __half2float(blk.d);
++            float q[5];
++            tq_codes5<N, W>(tr::word(blk, w), q);
++            float part[nc];
++#pragma unroll
++            for (int c = 0; c < nc; ++c) {
++                part[c] = 0.0f;
++            }
++#pragma unroll
++            for (int i = 0; i < 5; ++i) {
++                if (i < 4 || w < QK_TQD - 4*TQD_NW) {
++#pragma unroll
++                    for (int c = 0; c < nc; ++c) {
++                        part[c] = fmaf(q[i], xv[i][c], part[c]);
++                    }
++                }
++            }
++#pragma unroll
++            for (int c = 0; c < nc; ++c) {
++                acc[r][c] = fmaf(d, part[c], acc[r][c]);
++            }
++        }
++    }
++
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++#pragma unroll
++        for (int c = 0; c < nc; ++c) {
++            acc[r][c] = warp_reduce_sum(acc[r][c]);
++        }
++    }
++    if (lane == 0) {
++#pragma unroll
++        for (int r = 0; r < R; ++r) {
++            if (row0 + r < nrows) {
++#pragma unroll
++                for (int c = 0; c < nc; ++c) {
++                    ys[c][row0 + r] = acc[r][c];
++                }
++            }
++        }
++    }
++}
++
++// active experts (bounds[e+1] > bounds[e]) compacted into act[0..n_act-1], act[E] = n_act; one CTA
++static __global__ void tq_mt_active_experts(const int32_t * __restrict__ bounds, int32_t * __restrict__ act, const int E) {
++    __shared__ int cnt;
++    if (threadIdx.x == 0) cnt = 0;
++    __syncthreads();
++    // keep expert order: a block-wide scan over chunks of blockDim.x
++    __shared__ int base;
++    if (threadIdx.x == 0) base = 0;
++    __syncthreads();
++    for (int e0 = 0; e0 < E; e0 += blockDim.x) {
++        const int e = e0 + threadIdx.x;
++        const int f = e < E && bounds[e + 1] > bounds[e];
++        // warp scan
++        const int lane = threadIdx.x % WARP_SIZE, wid = threadIdx.x / WARP_SIZE;
++        const unsigned m = __ballot_sync(0xFFFFFFFF, f);
++        const int pre = __popc(m & ((1u << lane) - 1));
++        __shared__ int wsum[32];
++        if (lane == 0) wsum[wid] = __popc(m);
++        __syncthreads();
++        int off = base;
++        for (int k = 0; k < wid; ++k) off += wsum[k];
++        if (f) act[off + pre] = e;
++        __syncthreads();
++        if (threadIdx.x == 0) { int s = 0; for (int k = 0; k < (int) (blockDim.x/WARP_SIZE); ++k) s += wsum[k]; base += s; }
++        __syncthreads();
++    }
++    if (threadIdx.x == 0) act[E] = base;
++}
++
++// grid (row groups of 4 warps x R rows, active-expert slots) for MoE, (row groups, 1) for dense
++template <ggml_type type, int R>
++static __global__ void __launch_bounds__(TQ_MMV_ROWS_PER_CTA*WARP_SIZE)
++tq_mt_kernel(const char * __restrict__ W0, const float * __restrict__ X, float * __restrict__ Y,
++             const int64_t K, const int64_t nrows, const int64_t nb01, const int64_t nb02,
++             const int ncols_dense, const int64_t sx_col, const int64_t sy_col,
++             const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
++             const int32_t * __restrict__ act, const int n_experts, const int n_used, const int64_t sy1, const int64_t sy2) {
++    typedef typename tq_traits<type>::block block;
++
++    const int     lane = threadIdx.x;
++    const int64_t row0 = ((int64_t) blockIdx.x*TQ_MMV_ROWS_PER_CTA + threadIdx.y)*R;
++    if (row0 >= nrows) {
++        return;
++    }
++
++    int j0 = 0, j1 = ncols_dense;
++    int64_t expert = 0;
++    if (ids_src1) {
++        if ((int) blockIdx.y >= act[n_experts]) {
++            return;
++        }
++        expert = act[blockIdx.y];
++        j0 = bounds[expert];
++        j1 = bounds[expert + 1];
++    }
++
++    const block * wr[R];
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++        const int64_t row = row0 + r < nrows ? row0 + r : nrows - 1;
++        wr[r] = (const block *) (W0 + expert*nb02 + row*nb01);
++    }
++    const int nunits = (int)(K/QK_TQD)*TQD_NW;
++
++    for (int j = j0; j < j1; j += TQ_MT_MAXC) {
++        const int n = min(TQ_MT_MAXC, j1 - j);
++        const float * xs[TQ_MT_MAXC];
++        float       * ys[TQ_MT_MAXC];
++#pragma unroll
++        for (int c = 0; c < TQ_MT_MAXC; ++c) {
++            const int jc = j + (c < n ? c : 0);
++            if (ids_src1) {
++                const int v = ids_dst[jc];
++                xs[c] = X + (int64_t) ids_src1[jc]*sx_col;
++                ys[c] = Y + (int64_t)(v % n_used)*sy1 + (int64_t)(v / n_used)*sy2;
++            } else {
++                xs[c] = X + (int64_t) jc*sx_col;
++                ys[c] = Y + (int64_t) jc*sy_col;
++            }
++        }
++        switch (n) {
++            case 1: tq_mt_cols<type, 1, R>(wr, row0, nrows, xs, ys, nunits, lane); break;
++            case 2: tq_mt_cols<type, 2, R>(wr, row0, nrows, xs, ys, nunits, lane); break;
++            case 3: tq_mt_cols<type, 3, R>(wr, row0, nrows, xs, ys, nunits, lane); break;
++            case 4: tq_mt_cols<type, 4, R>(wr, row0, nrows, xs, ys, nunits, lane); break;
++            case 5: tq_mt_cols<type, 5, R>(wr, row0, nrows, xs, ys, nunits, lane); break;
++            case 6: tq_mt_cols<type, 6, R>(wr, row0, nrows, xs, ys, nunits, lane); break;
++            case 7: tq_mt_cols<type, 7, R>(wr, row0, nrows, xs, ys, nunits, lane); break;
++            default: tq_mt_cols<type, 8, R>(wr, row0, nrows, xs, ys, nunits, lane); break;
++        }
++    }
++}
++
++int ggml_cuda_tq_mt_mode() {
++    static int v = tq_env("GGML_CUDA_TQ_MT", 1);   // default on (v2, 2026-11-19); GGML_CUDA_TQ_MT=0 = stock path
++    return v;
++}
++
++static int tq_mt_min_cols() {
++    static int v = tq_env("GGML_CUDA_TQ_MT_MIN", 5);
++    return v;
++}
++
++static int tq_mt_max_cols() {   // GGML_CUDA_TQ_MT_MAX: MoE token cap (gate tests: 8 keeps prefill on the stock path)
++    static int v = tq_env("GGML_CUDA_TQ_MT_MAX", 1 << 30);
++    return v;
++}
++
++static bool tq_mt_base_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
++    if (!ggml_cuda_type_is_tq(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (src0->ne[0] % QK_TQD != 0 || src0->nb[0] != ggml_type_size(src0->type) || src0->ne[3] != 1 ||
++        src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
++        return false;
++    }
++    for (int i = 1; i < 4; ++i) {
++        if (src1->nb[i] % sizeof(float) != 0 || dst->nb[i] % sizeof(float) != 0) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool tq_env_dense_mt() {   // GGML_CUDA_TQ_MT_DENSE=1: dense > 8 columns on the exact chunked mat-vec too (default 0: stock cuBLAS, faster at >= 32)
++    static bool v = tq_env("GGML_CUDA_TQ_MT_DENSE", 0) != 0;
++    return v;
++}
++
++bool ggml_cuda_tq_mt_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
++    if (ggml_cuda_tq_mt_mode() == 0) {
++        return false;
++    }
++    if (!tq_mt_base_ok(src0, src1, dst)) {
++        return false;
++    }
++    if (ids) {
++        return ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && src1->ne[3] == 1 &&
++               src1->nb[2] % src1->nb[1] == 0 && src1->ne[2] < (1 << 22) && ids->ne[0] < (1 << 10) &&
++               src1->ne[2] >= tq_mt_min_cols() && src1->ne[2] <= tq_mt_max_cols();
++    }
++    return src0->ne[2] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] > TQ_MMV_MAX_COLS &&
++           src1->ne[1] <= tq_mt_max_cols() && tq_env_dense_mt();
++}
++
++template <ggml_type type>
++static void tq_mt_launch(const char * W0, const float * X, float * Y, int64_t K, int64_t nrows, int64_t nb01, int64_t nb02,
++                         int ncols_dense, int64_t sx_col, int64_t sy_col, const int32_t * ids_src1, const int32_t * ids_dst,
++                         const int32_t * bounds, const int32_t * act, int n_experts, int gy, int n_used, int64_t sy1, int64_t sy2,
++                         cudaStream_t stream) {
++    static const int R = tq_env("GGML_CUDA_TQ_MT_R", 4);
++    const dim3 block(WARP_SIZE, TQ_MMV_ROWS_PER_CTA, 1);
++#define TQ_MT_R(RR) do { \
++        const int rpc = TQ_MMV_ROWS_PER_CTA*RR; \
++        const dim3 grid((unsigned) ((nrows + rpc - 1)/rpc), (unsigned) gy, 1); \
++        tq_mt_kernel<type, RR><<<grid, block, 0, stream>>>(W0, X, Y, K, nrows, nb01, nb02, ncols_dense, sx_col, sy_col, \
++            ids_src1, ids_dst, bounds, act, n_experts, n_used, sy1, sy2); } while (0)
++    if (R >= 4) TQ_MT_R(4); else if (R == 2) TQ_MT_R(2); else TQ_MT_R(1);
++#undef TQ_MT_R
++}
++
++bool ggml_cuda_tq_mul_mat_mt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                             const ggml_tensor * ids, ggml_tensor * dst) {
++    if (!ggml_cuda_tq_mt_supports(src0, src1, ids, dst)) {
++        return false;
++    }
++    cudaStream_t stream = ctx.stream();
++    const char  * W0 = (const char  *) src0->data;
++    const float * X  = (const float *) src1->data;
++    float       * Y  = (float       *) dst->data;
++    const int64_t K = src0->ne[0], nrows = src0->ne[1];
++
++    int ncols_dense = 0, n_used = 1, n_experts = 1;
++    int64_t sx_col, sy_col = 0, sy1 = 0, sy2 = 0;
++    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool()), ids_dst(ctx.pool()), bounds(ctx.pool()), act(ctx.pool());
++    const int32_t * p_src1 = nullptr, * p_dst = nullptr, * p_bounds = nullptr, * p_act = nullptr;
++    int gy = 1;
++
++    if (ids) {
++        const int64_t ne12 = src1->ne[2];
++        n_used    = (int) ids->ne[0];
++        n_experts = (int) src0->ne[2];
++        ids_src1.alloc(ne12*n_used);
++        ids_dst.alloc(ne12*n_used);
++        bounds.alloc(n_experts + 1);
++        const int si1  = (int) (ids->nb[1]/sizeof(int32_t));
++        const int sis1 = (int) (src1->nb[2]/src1->nb[1]);
++        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
++            n_experts, (int) ne12, n_used, (int) src1->ne[1], si1, sis1, /*write_inverse =*/ false, stream);
++        CUDA_CHECK(cudaGetLastError());
++        act.alloc(n_experts + 1);
++        tq_mt_active_experts<<<1, 256, 0, stream>>>(bounds.get(), act.get(), n_experts);
++        p_src1 = ids_src1.get(); p_dst = ids_dst.get(); p_bounds = bounds.get(); p_act = act.get();
++        gy = (int) std::min<int64_t>(n_experts, ne12*n_used);
++        sx_col = src1->nb[1]/sizeof(float);
++        sy1    = dst->nb[1]/sizeof(float);
++        sy2    = dst->nb[2]/sizeof(float);
++    } else {
++        ncols_dense = (int) src1->ne[1];
++        sx_col = src1->nb[1]/sizeof(float);
++        sy_col = dst->nb[1]/sizeof(float);
++    }
++
++    switch (src0->type) {
++        case GGML_TYPE_TQ9_128:
++            tq_mt_launch<GGML_TYPE_TQ9_128>(W0, X, Y, K, nrows, src0->nb[1], src0->nb[2], ncols_dense, sx_col, sy_col,
++                p_src1, p_dst, p_bounds, p_act, n_experts, gy, n_used, sy1, sy2, stream);
++            break;
++        case GGML_TYPE_TQ27_128:
++            tq_mt_launch<GGML_TYPE_TQ27_128>(W0, X, Y, K, nrows, src0->nb[1], src0->nb[2], ncols_dense, sx_col, sy_col,
++                p_src1, p_dst, p_bounds, p_act, n_experts, gy, n_used, sy1, sy2, stream);
++            break;
++        case GGML_TYPE_TQ81_128:
++            tq_mt_launch<GGML_TYPE_TQ81_128>(W0, X, Y, K, nrows, src0->nb[1], src0->nb[2], ncols_dense, sx_col, sy_col,
++                p_src1, p_dst, p_bounds, p_act, n_experts, gy, n_used, sy1, sy2, stream);
++            break;
++        default:
++            return false;
++    }
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// (TR multi-token, GGML_CUDA_TQ_MM, default ON since v3 (=0 off), NOT bit-exact) tensor-core mat-mat for TQ at many columns (dense and
++// MoE grouped by expert). A CTA of 4 warps owns 64 weight rows; per 128-weight block the trits are decoded once into
++// shared memory as the small integers (u - L) in f16 (exact), the activations (pre-converted to f16, as the stock cuBLAS
++// path does) are staged next to them, and mma.sync m16n8k16 f16 x f16 -> f32 runs over 8*NT columns. The block key d is
++// applied per block to the f32 partial (acc += d * C_block), so the only roundings are the f16 activations and the f32
++// summation order. Not bit-exact vs the stock path (whose > 8 column dense path is cuBLAS on dequantised fp16 weights).
++
++#define TQ_MM_BM 64
++#define TQ_MM_KS 136   // shared-memory row stride in halves (128 + 8 pad: conflict-free fragment loads)
++
++static __device__ __forceinline__ void tq_mma_f16(float c[4], const uint32_t a[4], const uint32_t b0, const uint32_t b1) {
++#ifdef AMPERE_MMA_AVAILABLE
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++#else
++    GGML_UNUSED_VARS(c, a, b0, b1);
++    NO_DEVICE_CODE;
++#endif // AMPERE_MMA_AVAILABLE
++}
++
++static __global__ void tq_f32_to_f16_rows(const char * __restrict__ src, half * __restrict__ dst, const int64_t K,
++                                          const int64_t ne11, const int64_t nb11, const int64_t nb12) {
++    const int64_t r   = blockIdx.y;               // r = i12*ne11 + i11
++    const int64_t i11 = r % ne11, i12 = r / ne11;
++    const float * s = (const float *) (src + i12*nb12 + i11*nb11);
++    for (int64_t k = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; k < K; k += (int64_t) gridDim.x*blockDim.x) {
++        dst[r*K + k] = __float2half(s[k]);
++    }
++}
++
++template <ggml_type type, int NT>
++static __global__ void __launch_bounds__(4*WARP_SIZE)
++tq_mm_kernel(const char * __restrict__ W0, const half * __restrict__ Xh, float * __restrict__ Y,
++             const int64_t K, const int64_t nrows, const int64_t nb01, const int64_t nb02,
++             const int ncols_dense, const int64_t sy_col,
++             const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ bounds,
++             const int32_t * __restrict__ act, const int n_experts,
++             const int n_used, const int64_t ne11, const int64_t sy1, const int64_t sy2) {
++    typedef tq_traits<type> tr;
++    typedef typename tr::block block;
++    constexpr int N = tr::N, W = tr::W;
++    constexpr int NC = 8*NT;
++
++    __shared__ __align__(16) half As[TQ_MM_BM*TQ_MM_KS];
++    __shared__ __align__(16) half Bs[NC*TQ_MM_KS];
++    __shared__ float Ds[TQ_MM_BM];
++    __shared__ int64_t csrc[NC];
++    __shared__ int64_t cdst[NC];
++
++    const int tid = threadIdx.x, warp = tid / WARP_SIZE, lane = tid % WARP_SIZE;
++    const int g = lane >> 2, t = lane & 3;
++    const int64_t row_base = (int64_t) blockIdx.x*TQ_MM_BM;
++    const int nb = (int) (K/QK_TQD);
++
++    int64_t expert = 0;
++    int jb, je;
++    if (ids_dst) {
++        if ((int) blockIdx.y >= act[n_experts]) {
++            return;
++        }
++        expert = act[blockIdx.y];
++        jb = bounds[expert];
++        je = bounds[expert + 1];
++    } else {
++        jb = blockIdx.y*NC;
++        je = min(ncols_dense, jb + NC);
++    }
++    if (jb >= je) {
++        return;
++    }
++    const char * We = W0 + expert*nb02;
++
++    for (int j0 = jb; j0 < je; j0 += NC) {
++        const int ncur = min(NC, je - j0);
++        __syncthreads();
++        for (int c = tid; c < NC; c += blockDim.x) {
++            const int j = j0 + (c < ncur ? c : 0);
++            if (ids_dst) {
++                const int v = ids_dst[j];
++                const int tok = v / n_used, slot = v % n_used;
++                csrc[c] = ((int64_t) tok*ne11 + slot % ne11)*K;
++                cdst[c] = (int64_t) slot*sy1 + (int64_t) tok*sy2;
++            } else {
++                csrc[c] = (int64_t) j*K;
++                cdst[c] = (int64_t) j*sy_col;
++            }
++        }
++
++        float acc[NT][4];
++#pragma unroll
++        for (int n = 0; n < NT; ++n) {
++            acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
++        }
++
++        // register prefetch of block b+1 (raw words, keys, activations) while block b runs on the tensor cores
++        constexpr int UPT = TQ_MM_BM*TQD_NW/(4*WARP_SIZE);   // 13 word units per thread
++        static_assert(TQ_MM_BM*TQD_NW % (4*WARP_SIZE) == 0, "unit split");
++        uint32_t rw[UPT];
++        float    rd = 0.0f;
++        uint4    rb[NT];
++        auto load_raw = [&](const int b) {
++#pragma unroll
++            for (int k = 0; k < UPT; ++k) {
++                const int unit = tid + k*4*WARP_SIZE;
++                const int r = unit / TQD_NW, w = unit - r*TQD_NW;
++                const int64_t row = min(row_base + r, nrows - 1);
++                rw[k] = tr::word(((const block *) (We + row*nb01))[b], w);
++            }
++            if (tid < TQ_MM_BM) {
++                const int64_t row = min(row_base + tid, nrows - 1);
++                rd = __half2float(((const block *) (We + row*nb01))[b].d);
++            }
++#pragma unroll
++            for (int n = 0; n < NT; ++n) {
++                const int unit = tid + n*4*WARP_SIZE;
++                const int c = unit >> 4, part = unit & 15;
++                rb[n] = c < ncur ? *(const uint4 *) (Xh + csrc[c] + (int64_t) b*QK_TQD + part*8) : make_uint4(0, 0, 0, 0);
++            }
++        };
++        __syncthreads();   // csrc / cdst visible
++        load_raw(0);
++
++        for (int b = 0; b < nb; ++b) {
++            __syncthreads();
++#pragma unroll
++            for (int k = 0; k < UPT; ++k) {
++                const int unit = tid + k*4*WARP_SIZE;
++                const int r = unit / TQD_NW, w = unit - r*TQD_NW;
++                float q[5];
++                tq_codes5<N, W>(rw[k], q);
++                half * a = As + r*TQ_MM_KS + w;
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    a[i*TQD_NW] = __float2half(q[i]);
++                }
++                if (w < QK_TQD - 4*TQD_NW) {
++                    a[4*TQD_NW] = __float2half(q[4]);
++                }
++            }
++            if (tid < TQ_MM_BM) {
++                Ds[tid] = rd;
++            }
++#pragma unroll
++            for (int n = 0; n < NT; ++n) {
++                const int unit = tid + n*4*WARP_SIZE;
++                *(uint4 *) (Bs + (unit >> 4)*TQ_MM_KS + (unit & 15)*8) = rb[n];
++            }
++            __syncthreads();
++            if (b + 1 < nb) {
++                load_raw(b + 1);
++            }
++
++            float cb[NT][4];
++#pragma unroll
++            for (int n = 0; n < NT; ++n) {
++                cb[n][0] = cb[n][1] = cb[n][2] = cb[n][3] = 0.0f;
++            }
++            const half * Aw = As + (warp*16)*TQ_MM_KS;
++#pragma unroll
++            for (int ks = 0; ks < QK_TQD/16; ++ks) {
++                uint32_t a[4];
++                a[0] = *(const uint32_t *) (Aw + (g    )*TQ_MM_KS + ks*16 + 2*t);
++                a[1] = *(const uint32_t *) (Aw + (g + 8)*TQ_MM_KS + ks*16 + 2*t);
++                a[2] = *(const uint32_t *) (Aw + (g    )*TQ_MM_KS + ks*16 + 2*t + 8);
++                a[3] = *(const uint32_t *) (Aw + (g + 8)*TQ_MM_KS + ks*16 + 2*t + 8);
++#pragma unroll
++                for (int n = 0; n < NT; ++n) {
++                    const half * Bn = Bs + (n*8 + g)*TQ_MM_KS + ks*16 + 2*t;
++                    tq_mma_f16(cb[n], a, *(const uint32_t *) Bn, *(const uint32_t *) (Bn + 8));
++                }
++            }
++            const float d0 = Ds[warp*16 + g], d1 = Ds[warp*16 + g + 8];
++#pragma unroll
++            for (int n = 0; n < NT; ++n) {
++                acc[n][0] = fmaf(d0, cb[n][0], acc[n][0]);
++                acc[n][1] = fmaf(d0, cb[n][1], acc[n][1]);
++                acc[n][2] = fmaf(d1, cb[n][2], acc[n][2]);
++                acc[n][3] = fmaf(d1, cb[n][3], acc[n][3]);
++            }
++        }
++
++        const int64_t r0 = row_base + warp*16 + g, r1 = r0 + 8;
++#pragma unroll
++        for (int n = 0; n < NT; ++n) {
++            const int c0 = n*8 + 2*t, c1 = c0 + 1;
++            if (r0 < nrows) {
++                if (c0 < ncur) Y[cdst[c0] + r0] = acc[n][0];
++                if (c1 < ncur) Y[cdst[c1] + r0] = acc[n][1];
++            }
++            if (r1 < nrows) {
++                if (c0 < ncur) Y[cdst[c0] + r1] = acc[n][2];
++                if (c1 < ncur) Y[cdst[c1] + r1] = acc[n][3];
++            }
++        }
++    }
++}
++
++int ggml_cuda_tq_mm_mode() {
++    static int v = tq_env("GGML_CUDA_TQ_MM", 1);   // default on (v3, 2026-11-20, value-changing); GGML_CUDA_TQ_MM=0 = exact MT path
++    return v;
++}
++
++bool ggml_cuda_tq_mm_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
++    if (ggml_cuda_tq_mm_mode() == 0 || !tq_mt_base_ok(src0, src1, dst) ||
++        !ampere_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
++        return false;
++    }
++    if (ids) {
++        static const int mmid_min = tq_env("GGML_CUDA_TQ_MM_ID_MIN", 24);
++        return ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) && src1->ne[3] == 1 &&
++               src1->ne[2] < (1 << 22) && ids->ne[0] < (1 << 10) && src1->ne[2] >= mmid_min;
++    }
++    static const int mm_min      = tq_env("GGML_CUDA_TQ_MM_MIN", 8);
++    static const int mm_min_rows = tq_env("GGML_CUDA_TQ_MM_MIN_ROWS", 2048);   // fewer rows: too few CTAs, cuBLAS wins
++    return src0->ne[2] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] >= mm_min && src0->ne[1] >= mm_min_rows;
++}
++
++template <ggml_type type, int NT>
++static void tq_mm_launch(const char * W0, const half * Xh, float * Y, int64_t K, int64_t nrows, int64_t nb01, int64_t nb02,
++                         int ncols_dense, int64_t sy_col, const int32_t * ids_dst, const int32_t * bounds,
++                         const int32_t * act, int n_experts, int n_used,
++                         int64_t ne11, int64_t sy1, int64_t sy2, int gy, cudaStream_t stream) {
++    const dim3 grid((unsigned) ((nrows + TQ_MM_BM - 1)/TQ_MM_BM), (unsigned) gy, 1);
++    tq_mm_kernel<type, NT><<<grid, 4*WARP_SIZE, 0, stream>>>(W0, Xh, Y, K, nrows, nb01, nb02, ncols_dense, sy_col,
++        ids_dst, bounds, act, n_experts, n_used, ne11, sy1, sy2);
++}
++
++template <ggml_type type>
++static void tq_mm_switch(int NT, const char * W0, const half * Xh, float * Y, int64_t K, int64_t nrows, int64_t nb01, int64_t nb02,
++                         int ncols_dense, int64_t sy_col, const int32_t * ids_dst, const int32_t * bounds,
++                         const int32_t * act, int n_experts, int n_used,
++                         int64_t ne11, int64_t sy1, int64_t sy2, int gy, cudaStream_t stream) {
++#define TQ_MM_CASE(n) case n: tq_mm_launch<type, n>(W0, Xh, Y, K, nrows, nb01, nb02, ncols_dense, sy_col, ids_dst, bounds, \
++                          act, n_experts, n_used, ne11, sy1, sy2, gy, stream); break;
++    switch (NT) {
++        TQ_MM_CASE(1) TQ_MM_CASE(2) TQ_MM_CASE(3) TQ_MM_CASE(4) TQ_MM_CASE(5) TQ_MM_CASE(6) TQ_MM_CASE(7) TQ_MM_CASE(8)
++        default: tq_mm_launch<type, 9>(W0, Xh, Y, K, nrows, nb01, nb02, ncols_dense, sy_col, ids_dst, bounds, act, n_experts, n_used, ne11, sy1, sy2, gy, stream); break;
++    }
++#undef TQ_MM_CASE
++}
++
++bool ggml_cuda_tq_mul_mat_mm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                             const ggml_tensor * ids, ggml_tensor * dst) {
++    if (!ggml_cuda_tq_mm_supports(src0, src1, ids, dst)) {
++        return false;
++    }
++    cudaStream_t stream = ctx.stream();
++    const int64_t K = src0->ne[0], nrows = src0->ne[1];
++    const int64_t ne11 = src1->ne[1], ne12 = src1->ne[2];
++
++    // activations -> contiguous f16 rows [i12*ne11 + i11][K]
++    ggml_cuda_pool_alloc<half> xh(ctx.pool(), ne11*ne12*K);
++    {
++        const dim3 grid((unsigned) std::min<int64_t>((K + 255)/256, 16), (unsigned) (ne11*ne12), 1);
++        tq_f32_to_f16_rows<<<grid, 256, 0, stream>>>((const char *) src1->data, xh.get(), K, ne11, src1->nb[1], src1->nb[2]);
++    }
++
++    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool()), ids_dst(ctx.pool()), bounds(ctx.pool()), act(ctx.pool());
++    int NT, gy, ncols_dense = 0, n_used = 1, n_experts = 1;
++    int64_t sy_col = 0, sy1 = 0, sy2 = 0;
++    const int32_t * p_dst = nullptr, * p_bounds = nullptr, * p_act = nullptr;
++    if (ids) {
++        n_used = (int) ids->ne[0];
++        n_experts = (int) src0->ne[2];
++        ids_src1.alloc(ne12*n_used);
++        ids_dst.alloc(ne12*n_used);
++        bounds.alloc(n_experts + 1);
++        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
++            n_experts, (int) ne12, n_used, (int) ne11, (int) (ids->nb[1]/sizeof(int32_t)), (int) (src1->nb[2]/src1->nb[1]),
++            /*write_inverse =*/ false, stream);
++        CUDA_CHECK(cudaGetLastError());
++        act.alloc(n_experts + 1);
++        tq_mt_active_experts<<<1, 256, 0, stream>>>(bounds.get(), act.get(), n_experts);
++        p_dst = ids_dst.get(); p_bounds = bounds.get(); p_act = act.get();
++        static const int nt_id = tq_env("GGML_CUDA_TQ_MM_ID_NT", 1);
++        NT = nt_id;
++        gy = (int) std::min<int64_t>(n_experts, ne12*n_used);
++        sy1 = dst->nb[1]/sizeof(float);
++        sy2 = dst->nb[2]/sizeof(float);
++    } else {
++        ncols_dense = (int) ne11;
++        NT = std::min(9, (ncols_dense + 7)/8);
++        gy = (ncols_dense + 8*NT - 1)/(8*NT);
++        sy_col = dst->nb[1]/sizeof(float);
++    }
++
++    const char * W0 = (const char *) src0->data;
++    float * Y = (float *) dst->data;
++    switch (src0->type) {
++        case GGML_TYPE_TQ9_128:
++            tq_mm_switch<GGML_TYPE_TQ9_128>(NT, W0, xh.get(), Y, K, nrows, src0->nb[1], src0->nb[2], ncols_dense, sy_col,
++                p_dst, p_bounds, p_act, n_experts, n_used, ne11, sy1, sy2, gy, stream);
++            break;
++        case GGML_TYPE_TQ27_128:
++            tq_mm_switch<GGML_TYPE_TQ27_128>(NT, W0, xh.get(), Y, K, nrows, src0->nb[1], src0->nb[2], ncols_dense, sy_col,
++                p_dst, p_bounds, p_act, n_experts, n_used, ne11, sy1, sy2, gy, stream);
++            break;
++        case GGML_TYPE_TQ81_128:
++            tq_mm_switch<GGML_TYPE_TQ81_128>(NT, W0, xh.get(), Y, K, nrows, src0->nb[1], src0->nb[2], ncols_dense, sy_col,
++                p_dst, p_bounds, p_act, n_experts, n_used, ne11, sy1, sy2, gy, stream);
++            break;
++        default:
++            return false;
++    }
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
+diff --git a/ggml/src/ggml-cuda/tq.cuh b/ggml/src/ggml-cuda/tq.cuh
+index caaa69ede..224aef500 100644
+--- a/ggml/src/ggml-cuda/tq.cuh
++++ b/ggml/src/ggml-cuda/tq.cuh
+@@ -97,3 +97,14 @@ static __device__ __forceinline__ void dequantize_tq(const void * vx, const int6
+ // Decode mat-vec / MoE mat-vec for TQ src0, f32 src1/dst. Returns false if the shape is not handled (caller falls back).
+ bool ggml_cuda_tq_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                               const ggml_tensor * ids, ggml_tensor * dst);
++
++// (TR multi-token) GGML_CUDA_TQ_MT (default 1; 0 = stock): exact multi-token paths (MoE grouped by expert on the device, dense > 8 columns).
++int  ggml_cuda_tq_mt_mode();
++bool ggml_cuda_tq_mt_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst);
++bool ggml_cuda_tq_mul_mat_mt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                             const ggml_tensor * ids, ggml_tensor * dst);
++// (TR multi-token) GGML_CUDA_TQ_MM (default 1 since v3): tensor-core mat-mat at >= GGML_CUDA_TQ_MM_MIN (dense) / _MM_ID_MIN (MoE) columns. Not bit-exact.
++int  ggml_cuda_tq_mm_mode();
++bool ggml_cuda_tq_mm_supports(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst);
++bool ggml_cuda_tq_mul_mat_mm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++                             const ggml_tensor * ids, ggml_tensor * dst);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b0c0f3907..48dffbb1c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12136,6 +12136,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // (TR multi-token, 11-19) draft-verify shapes, 1-65 tokens: TQ vs Q4_K (env TBO_MT_ONLY=1 runs only these)
++    for (ggml_type type_a : {GGML_TYPE_TQ9_128, GGML_TYPE_TQ27_128, GGML_TYPE_Q4_K}) {
++        for (int bs : {1, 2, 4, 8, 16, 32, 65}) {
++            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false,  512, bs, 2048)); // experts gate / up
++            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, bs,  512)); // experts down
++            for (auto mk : std::vector<std::array<int64_t, 2>>{{8192, 2048}, {2048, 4096}, {512, 2048}, {248320, 2048}}) {
++                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk[0], bs, mk[1], {1, 1}, {1, 1}));
++            }
++        }
++    }
++    if (getenv("TBO_MT_ONLY")) {
++        return test_cases;
++    }
++
+     // Qwen3.6-35B-A3B decode shapes for the dense trit types (and Q8_0 / Q4_0 for reference)
+     for (ggml_type type_a : {GGML_TYPE_TQ9_128, GGML_TYPE_TQ27_128, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+         for (int bs : {1, 4}) {
+-- 
+2.54.0 (Apple Git-157)
+
