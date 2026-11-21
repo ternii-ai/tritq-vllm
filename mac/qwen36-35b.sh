@@ -16,9 +16,9 @@ DIR=${TR_DIR:-$HOME/qwen36-35b-tr}
 PORT=${TR_PORT:-8080}
 CACHE=${TR_CACHE_MIB:-8400}
 CTX=${TR_CTX:-4096}
-REL=llama.cpp-tr-b11721-r3
+REL=llama.cpp-tr-b11721-r4
 BIN_URL=https://github.com/ternii-ai/tritq-vllm/releases/download/$REL/llama.cpp-tr-macos-arm64.tar.gz
-BIN_SHA=64f2a57f1b7f7d16c65b30358a21daec0cc019c44ba734913cbcf29ba04777c1
+BIN_SHA=4f2d890f4c2ff444df5fa5ca66ab94e29e314b6e16ca94a8c296e7dc66708e8e
 HF=https://huggingface.co/Ternii/Qwen3.6-35B-A3B-TR2.25-G-GGUF/resolve/main
 MODEL=Qwen3.6-35B-A3B-TR2.25-G
 # name  size  sha256

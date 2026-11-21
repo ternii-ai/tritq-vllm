@@ -18,9 +18,9 @@ set -euo pipefail
 DIR=${TR_DIR:-$HOME/qwen38-tr}
 PORT=${TR_PORT:-8080}
 CTX=${TR_CTX:-32768}
-REL=llama.cpp-tr-b11721-r3
+REL=llama.cpp-tr-b11721-r4
 BIN_URL=https://github.com/ternii-ai/tritq-vllm/releases/download/$REL/llama.cpp-tr-macos-arm64.tar.gz
-BIN_SHA=64f2a57f1b7f7d16c65b30358a21daec0cc019c44ba734913cbcf29ba04777c1
+BIN_SHA=4f2d890f4c2ff444df5fa5ca66ab94e29e314b6e16ca94a8c296e7dc66708e8e
 HF=https://huggingface.co/Ternii/Qwen3.8-Flash-Next-TR2.31-G-GGUF/resolve/main
 MODEL=Qwen3.8-Flash-Next-TR2.31-G
 # name  size  sha256
