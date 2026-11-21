@@ -1,0 +1,768 @@
+From ef1c29d116b36f7fc82e2ac10d473c331754c8d2 Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 13:03:58 +0000
+Subject: [PATCH] ggml-cuda: mat-mat v4 for the dense trit types (default on)
+
+GGML_CUDA_TQ_MM_V2 (default 1): a second tensor-core mat-mat kernel for
+dense (non-MoE) layers of the dense trit types, used when GGML_CUDA_TQ_MM
+is on. Prompt processing about 3 % faster than the 0011 mat-mat on a DGX
+Spark; decode level. Value-changing: outputs differ from
+GGML_CUDA_TQ_MM_V2=0, which restores the 0011 mat-mat.
+GGML_CUDA_TQ_MM=0 still turns all mat-mat paths off.
+---
+ ggml/src/ggml-cuda/tq.cu   | 699 +++++++++++++++++++++++++++++++++++++
+ tests/test-backend-ops.cpp |  12 +-
+ 2 files changed, 709 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/tq.cu b/ggml/src/ggml-cuda/tq.cu
+index d85ae2406..9b8fbb50a 100644
+--- a/ggml/src/ggml-cuda/tq.cu
++++ b/ggml/src/ggml-cuda/tq.cu
+@@ -1069,6 +1069,702 @@ tq_mm_kernel(const char * __restrict__ W0, const half * __restrict__ Xh, float *
+     }
+ }
+ 
++// ---------------------------------------------------------------------------------------------------------------------
++// (TR multi-token round 4, GGML_CUDA_TQ_MM_V2) dense tensor-core mat-mat, v2 kernel. NOT bit-exact (as v1 MM).
++// Differences from tq_mm_kernel (v1):
++//  - the trits never go through shared memory: each thread decodes exactly the A-fragment elements it feeds to
++//    mma.sync m16n8k16, straight from the raw words in registers. That needs a k-permutation inside each 128-weight block
++//    (any permutation is fine as long as A and B agree): thread t (= lane % 4) owns words 6t..6t+5 (all 5 digits) plus 2
++//    digits of word 24 + (t >> 1) -> 32 values per row = its 32 k-slots of the 8 k16 steps; no padding, no redundancy.
++//    The activations are converted to f16 in that permuted order once per call (tq_f32_to_f16_perm).
++//  - A = f16(u - L) built from 0x6400 | u (= f16 1024 + u) with one HSUB2 per pair (exact).
++//  - B (activations) in shared memory, double-buffered with cp.async, fragments by ldmatrix.x4.
++//  - WM warps x 16 rows per CTA, split-K over gridDim.z with a fixed-order reduction (deterministic).
++// The per-block key d is applied to the f32 partial exactly as v1 (acc += d * C_block). The only difference to v1 is the
++// order of the 128 products inside the tensor-core sums of a block.
++
++static __device__ __forceinline__ int tq_perm_src(const int p) {   // permuted slot p (0..127) -> original weight index j
++    const int ks = p >> 4, q = p & 15, t = (q & 7) >> 1, e = (q & 1) | ((q >> 3) << 1), i = 4*ks + e;
++    int w, d;
++    if (i < 30) { w = 6*t + i/5; d = i % 5; } else { w = 24 + (t >> 1); d = 2*(t & 1) + (i - 30); }
++    return d*TQD_NW + w;
++}
++
++static __global__ void tq_f32_to_f16_perm(const char * __restrict__ src, half * __restrict__ dst, const int64_t K,
++                                          const int64_t nb11) {
++    const int64_t c = blockIdx.y;
++    const float * s = (const float *) (src + c*nb11);
++    for (int64_t k = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; k < K; k += (int64_t) gridDim.x*blockDim.x) {
++        const int64_t blk = k / QK_TQD;
++        dst[c*K + k] = __float2half(s[blk*QK_TQD + tq_perm_src((int) (k % QK_TQD))]);
++    }
++}
++
++static __device__ __forceinline__ void tq_cp_async16(void * smem, const void * gmem, const bool valid) {
++#ifdef AMPERE_MMA_AVAILABLE
++    const unsigned int sa = (unsigned int) __cvta_generic_to_shared(smem);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(sa), "l"(gmem), "r"(valid ? 16 : 0));
++#else
++    GGML_UNUSED_VARS(smem, gmem, valid);
++#endif
++}
++static __device__ __forceinline__ void tq_cp_async_commit() {
++#ifdef AMPERE_MMA_AVAILABLE
++    asm volatile("cp.async.commit_group;\n" ::);
++#endif
++}
++template <int n>
++static __device__ __forceinline__ void tq_cp_async_wait() {
++#ifdef AMPERE_MMA_AVAILABLE
++    asm volatile("cp.async.wait_group %0;\n" :: "n"(n));
++#endif
++}
++static __device__ __forceinline__ void tq_ldmatrix_x4(uint32_t r[4], const half * smem) {
++#ifdef AMPERE_MMA_AVAILABLE
++    const unsigned int sa = (unsigned int) __cvta_generic_to_shared(smem);
++    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
++                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(sa));
++#else
++    GGML_UNUSED_VARS(r, smem);
++#endif
++}
++
++// raw words of one row for one block, thread t: words 6t..6t+5 and word 24 + (t >> 1)
++template <ggml_type type>
++static __device__ __forceinline__ void tq_mm2_load_row(const typename tq_traits<type>::block & b, const int t,
++                                                       uint32_t w[7], half & d) {
++    typedef tq_traits<type> tr;
++#pragma unroll
++    for (int c = 0; c < 6; ++c) {
++        w[c] = tr::word(b, 6*t + c);
++    }
++    w[6] = tr::word(b, 24 + (t >> 1));
++    d = b.d;
++}
++
++// decode one row's 32 values into 16 f16 pairs: pair m = values 2m, 2m+1 (local order i of tq_perm_src)
++template <int N, int W>
++static __device__ __forceinline__ void tq_mm2_decode_row(const uint32_t w[7], const int t, uint32_t pr[16]) {
++    constexpr uint32_t P1 = tq_pow<N, 1>::v, P2 = tq_pow<N, 2>::v, P3 = tq_pow<N, 3>::v, P4 = tq_pow<N, 4>::v;
++    uint32_t u[32];
++#pragma unroll
++    for (int c = 0; c < 6; ++c) {
++        const uint32_t X = W == 32 ? w[c] : w[c] << (32 - W);
++        u[5*c + 0] = __umulhi(X,    (uint32_t) N);
++        u[5*c + 1] = __umulhi(X*P1, (uint32_t) N);
++        u[5*c + 2] = __umulhi(X*P2, (uint32_t) N);
++        u[5*c + 3] = __umulhi(X*P3, (uint32_t) N);
++        u[5*c + 4] = __umulhi(X*P4, (uint32_t) N);
++    }
++    {
++        const uint32_t X  = W == 32 ? w[6] : w[6] << (32 - W);
++        const uint32_t Xs = (t & 1) ? X*P2 : X;   // digits 2, 3 for odd t, else 0, 1
++        u[30] = __umulhi(Xs,    (uint32_t) N);
++        u[31] = __umulhi(Xs*P1, (uint32_t) N);
++    }
++    const half2 off = __halves2half2(__float2half(1024.0f + (N - 1)/2), __float2half(1024.0f + (N - 1)/2));
++#pragma unroll
++    for (int m = 0; m < 16; ++m) {
++        const uint32_t x = 0x64006400u | u[2*m] | (u[2*m + 1] << 16);
++        const half2 h = __hsub2(*(const half2 *) &x, off);
++        pr[m] = *(const uint32_t *) &h;
++    }
++}
++
++static __device__ __forceinline__ void tq_cp_async4(void * smem, const void * gmem, const int nbytes) {
++#ifdef AMPERE_MMA_AVAILABLE
++    const unsigned int sa = (unsigned int) __cvta_generic_to_shared(smem);
++    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" :: "r"(sa), "l"(gmem), "r"(nbytes));
++#else
++    GGML_UNUSED_VARS(smem, gmem, nbytes);
++#endif
++}
++
++// (round 4, A via smem) raw TQ blocks of BM rows staged with coalesced 4-byte cp.async: row r of the stage holds the
++// 4-byte-aligned window that contains block b of that row (the block starts at byte (addr & 3) of the window; bytes past
++// the block are zero-filled, never read from global). RS = window bytes per row.
++template <typename block>
++struct tq_araw { static constexpr int NW4 = (int) ((sizeof(block) + 2 + 3)/4); static constexpr int RS = 4*NW4; };
++
++template <typename block, int BM, int NTHR>
++static __device__ __forceinline__ void tq_issue_araw(char * dst, const char * W0, const int64_t row_base, const int64_t nrows,
++                                                     const int64_t nb01, const int b, const int tid) {
++    constexpr int NW4 = tq_araw<block>::NW4;
++    for (int idx = tid; idx < BM*NW4; idx += NTHR) {
++        const int r = idx / NW4, q = idx - r*NW4;
++        const char * addr = W0 + min(row_base + r, nrows - 1)*nb01 + (int64_t) b*(int64_t) sizeof(block);
++        const char * base = (const char *) ((uintptr_t) addr & ~(uintptr_t) 3);
++        const int rem = (int) (addr + sizeof(block) - (base + 4*q));
++        const int n = rem >= 4 ? 4 : (rem > 0 ? rem : 0);
++        tq_cp_async4(dst + r*tq_araw<block>::RS + 4*q, n > 0 ? base + 4*q : base, n);
++    }
++}
++
++template <typename block>
++static __device__ __forceinline__ const block & tq_araw_row(const char * stage, const int r, const char * W0, const int64_t row,
++                                                            const int64_t nb01, const int b) {
++    const int off = (int) ((uintptr_t) (W0 + row*nb01 + (int64_t) b*(int64_t) sizeof(block)) & 3);
++    return *(const block *) (stage + r*tq_araw<block>::RS + off);
++}
++
++#define TQ_MM2_KS 136   // smem row stride in halves (272 B: ldmatrix rows conflict-free)
++
++template <ggml_type type, int NT, int WM, bool AS>
++static __global__ void __launch_bounds__(WM*WARP_SIZE)
++tq_mm2_kernel(const char * __restrict__ W0, const half * __restrict__ Xp, float * __restrict__ Y,
++              const int64_t K, const int64_t nrows, const int64_t nb01, const int ncols, const int64_t sy_col,
++              const int nbs) {
++#ifdef AMPERE_MMA_AVAILABLE
++    typedef tq_traits<type> tr;
++    typedef typename tr::block block;
++    constexpr int N = tr::N, W = tr::W;
++    constexpr int NC = 8*NT;
++    constexpr int NTHR = WM*WARP_SIZE;
++
++    __shared__ __align__(16) half Bs[2][NC*TQ_MM2_KS];
++    extern __shared__ __align__(16) char tq_mm2_araw[];   // AS: [2][16*WM][RS] raw blocks
++    constexpr int ASTG = 16*WM*tq_araw<block>::RS;
++    char * const ARAW = tq_mm2_araw;
++
++    const int tid = threadIdx.x, warp = tid / WARP_SIZE, lane = tid % WARP_SIZE;
++    const int g = lane >> 2, t = lane & 3;
++    const int nb = (int) (K/QK_TQD);
++    const int b0 = blockIdx.z*nbs, b1 = min(nb, b0 + nbs);
++    const int jb = blockIdx.y*NC, ncur = min(NC, ncols - jb);
++    const int64_t rA = (int64_t) blockIdx.x*(16*WM) + warp*16 + g;
++    const block * wr0 = (const block *) (W0 + min(rA,     nrows - 1)*nb01);
++    const block * wr1 = (const block *) (W0 + min(rA + 8, nrows - 1)*nb01);
++
++    auto issue_b = [&](const int b, const int s) {
++#pragma unroll
++        for (int c = tid; c < NC*16; c += NTHR) {
++            const int col = c >> 4, part = c & 15;
++            const bool v = col < ncur;
++            tq_cp_async16(&Bs[s][col*TQ_MM2_KS + part*8], Xp + (int64_t) (jb + (v ? col : 0))*K + (int64_t) b*QK_TQD + part*8, v);
++        }
++        tq_cp_async_commit();
++    };
++
++    float acc[NT][4];
++#pragma unroll
++    for (int n = 0; n < NT; ++n) {
++        acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
++    }
++
++    uint32_t w0[7], w1[7];
++    half d0h, d1h;
++    const int64_t row_base = (int64_t) blockIdx.x*(16*WM);
++    if (b0 < b1) {
++        if constexpr (AS) {
++            tq_issue_araw<block, 16*WM, NTHR>(ARAW, W0, row_base, nrows, nb01, b0, tid);
++        }
++        issue_b(b0, 0);
++        if constexpr (!AS) {
++            tq_mm2_load_row<type>(wr0[b0], t, w0, d0h);
++            tq_mm2_load_row<type>(wr1[b0], t, w1, d1h);
++        }
++    }
++    // ldmatrix.x4 lane address: matrix m = lane >> 3 -> (k16 step +(m >> 1), k half m & 1), row = lane & 7
++    const int lm = lane >> 3, lr = lane & 7;
++    const int boff = lr*TQ_MM2_KS + (lm >> 1)*16 + (lm & 1)*8;
++
++    for (int b = b0; b < b1; ++b) {
++        const int s = (b - b0) & 1;
++        if (b + 1 < b1) {
++            if constexpr (AS) {
++                tq_issue_araw<block, 16*WM, NTHR>(ARAW + (s ^ 1)*ASTG, W0, row_base, nrows, nb01, b + 1, tid);
++            }
++            issue_b(b + 1, s ^ 1);
++        }
++        if constexpr (AS) {   // raw words of block b come from the smem stage: wait for it first
++            if (b + 1 < b1) {
++                tq_cp_async_wait<1>();
++            } else {
++                tq_cp_async_wait<0>();
++            }
++            __syncthreads();
++            tq_mm2_load_row<type>(tq_araw_row<block>(ARAW + s*ASTG, warp*16 + g,     W0, min(rA,     nrows - 1), nb01, b), t, w0, d0h);
++            tq_mm2_load_row<type>(tq_araw_row<block>(ARAW + s*ASTG, warp*16 + g + 8, W0, min(rA + 8, nrows - 1), nb01, b), t, w1, d1h);
++        }
++        uint32_t a0[16], a1[16];
++        tq_mm2_decode_row<N, W>(w0, t, a0);
++        tq_mm2_decode_row<N, W>(w1, t, a1);
++        const float d0 = __half2float(d0h), d1 = __half2float(d1h);
++        if constexpr (!AS) {
++            if (b + 1 < b1) {
++                tq_mm2_load_row<type>(wr0[b + 1], t, w0, d0h);
++                tq_mm2_load_row<type>(wr1[b + 1], t, w1, d1h);
++                tq_cp_async_wait<1>();
++            } else {
++                tq_cp_async_wait<0>();
++            }
++            __syncthreads();
++        }
++
++        float cb[NT][4];
++#pragma unroll
++        for (int n = 0; n < NT; ++n) {
++            cb[n][0] = cb[n][1] = cb[n][2] = cb[n][3] = 0.0f;
++        }
++        const half * B = Bs[s] + boff;
++#pragma unroll
++        for (int ks = 0; ks < 8; ks += 2) {
++            // A fragment of step ks: {row g k 2t.., row g+8 k 2t.., row g k 2t+8.., row g+8 k 2t+8..} = pairs 2ks, 2ks+1
++            const uint32_t A0[4] = {a0[2*ks],     a1[2*ks],     a0[2*ks + 1], a1[2*ks + 1]};
++            const uint32_t A1[4] = {a0[2*ks + 2], a1[2*ks + 2], a0[2*ks + 3], a1[2*ks + 3]};
++#pragma unroll
++            for (int n = 0; n < NT; ++n) {
++                uint32_t bb[4];
++                tq_ldmatrix_x4(bb, B + n*8*TQ_MM2_KS + ks*16);
++                tq_mma_f16(cb[n], A0, bb[0], bb[1]);
++                tq_mma_f16(cb[n], A1, bb[2], bb[3]);
++            }
++        }
++#pragma unroll
++        for (int n = 0; n < NT; ++n) {
++            acc[n][0] = fmaf(d0, cb[n][0], acc[n][0]);
++            acc[n][1] = fmaf(d0, cb[n][1], acc[n][1]);
++            acc[n][2] = fmaf(d1, cb[n][2], acc[n][2]);
++            acc[n][3] = fmaf(d1, cb[n][3], acc[n][3]);
++        }
++        __syncthreads();   // stage s is overwritten by the cp.async issued in iteration b + 1
++    }
++
++    // output: gridDim.z == 1 -> Y (column stride sy_col); else partial slice z of [z][ncols][nrows]
++    float * out = Y;
++    int64_t cs = sy_col;
++    if (gridDim.z > 1) {
++        out = Y + (int64_t) blockIdx.z*ncols*nrows;
++        cs = nrows;
++    }
++    const int64_t r0 = rA, r1 = rA + 8;
++#pragma unroll
++    for (int n = 0; n < NT; ++n) {
++        const int c0 = n*8 + 2*t, c1 = c0 + 1;
++        if (r0 < nrows) {
++            if (c0 < ncur) out[(jb + c0)*cs + r0] = acc[n][0];
++            if (c1 < ncur) out[(jb + c1)*cs + r0] = acc[n][1];
++        }
++        if (r1 < nrows) {
++            if (c0 < ncur) out[(jb + c0)*cs + r1] = acc[n][2];
++            if (c1 < ncur) out[(jb + c1)*cs + r1] = acc[n][3];
++        }
++    }
++#else
++    GGML_UNUSED_VARS(W0, Xp, Y, K, nrows, nb01, ncols, sy_col, nbs);
++    NO_DEVICE_CODE;
++#endif // AMPERE_MMA_AVAILABLE
++}
++
++// fixed-order split-K reduction: Y[c*sy_col + r] = sum_z P[z][c][r]
++static __global__ void tq_mm2_reduce(const float * __restrict__ P, float * __restrict__ Y, const int64_t nrows,
++                                     const int ncols, const int64_t sy_col, const int S) {
++    const int64_t r = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    const int c = blockIdx.y;
++    if (r >= nrows) {
++        return;
++    }
++    float s = 0.0f;
++    for (int z = 0; z < S; ++z) {
++        s += P[((int64_t) z*ncols + c)*nrows + r];
++    }
++    Y[c*sy_col + r] = s;
++}
++
++// GGML_CUDA_TQ_MM2_AS (round 4): raw trit words staged in smem by coalesced cp.async (1) or loaded straight into registers
++// (0). Default -1 = per shape, from the round-4 A/B on GB10 (logs/opperf_as*): smem wins for TQ27/TQ81 (f16) and for
++// lm_head-size row counts; registers win for TQ9 at <= 8192 rows and for the int8 variant below lm_head size.
++static int tq_mm2_as_env() {
++    static int v = tq_env("GGML_CUDA_TQ_MM2_AS", -1);
++    return v;
++}
++static int tq_mm2_as_cur = 1;   // set per call by tq_mul_mat_mm2 (host, single stream per process in practice)
++static int tq_mm2_as() {
++    return tq_mm2_as_cur;
++}
++
++static int tq_mm_v2() {
++    static int v = tq_env("GGML_CUDA_TQ_MM_V2", 1);   // default on (v4, r5): =1 f16 mat-mat v4, =0 v3 mat-mat (r4), =2 int8 variant (not gated)
++    return v;
++}
++
++template <ggml_type type, int NT, int WM>
++static void tq_mm2_launch(const char * W0, const half * Xp, float * Y, int64_t K, int64_t nrows, int64_t nb01,
++                          int ncols, int64_t sy_col, int gy, int S, int nbs, cudaStream_t stream) {
++    const dim3 grid((unsigned) ((nrows + 16*WM - 1)/(16*WM)), (unsigned) gy, (unsigned) S);
++    if (tq_mm2_as()) {
++        const int dyn = 2*16*WM*tq_araw<typename tq_traits<type>::block>::RS;
++        static bool attr = false;
++        if (!attr) {
++            CUDA_CHECK(cudaFuncSetAttribute(tq_mm2_kernel<type, NT, WM, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
++            attr = true;
++        }
++        tq_mm2_kernel<type, NT, WM, true><<<grid, WM*WARP_SIZE, dyn, stream>>>(W0, Xp, Y, K, nrows, nb01, ncols, sy_col, nbs);
++    } else {
++        tq_mm2_kernel<type, NT, WM, false><<<grid, WM*WARP_SIZE, 0, stream>>>(W0, Xp, Y, K, nrows, nb01, ncols, sy_col, nbs);
++    }
++}
++
++template <ggml_type type, int WM>
++static void tq_mm2_switch(int NT, const char * W0, const half * Xp, float * Y, int64_t K, int64_t nrows, int64_t nb01,
++                          int ncols, int64_t sy_col, int gy, int S, int nbs, cudaStream_t stream) {
++#define TQ_MM2_CASE(n) case n: tq_mm2_launch<type, n, WM>(W0, Xp, Y, K, nrows, nb01, ncols, sy_col, gy, S, nbs, stream); break;
++    switch (NT) {
++        TQ_MM2_CASE(1) TQ_MM2_CASE(2) TQ_MM2_CASE(3) TQ_MM2_CASE(4) TQ_MM2_CASE(5) TQ_MM2_CASE(6) TQ_MM2_CASE(7) TQ_MM2_CASE(8)
++        default: tq_mm2_launch<type, 9, WM>(W0, Xp, Y, K, nrows, nb01, ncols, sy_col, gy, S, nbs, stream); break;
++    }
++#undef TQ_MM2_CASE
++}
++
++template <ggml_type type>
++static void tq_mm2_dispatch(int WM, int NT, const char * W0, const half * Xp, float * Y, int64_t K, int64_t nrows,
++                            int64_t nb01, int ncols, int64_t sy_col, int gy, int S, int nbs, cudaStream_t stream) {
++    if (WM == 8) {
++        tq_mm2_switch<type, 8>(NT, W0, Xp, Y, K, nrows, nb01, ncols, sy_col, gy, S, nbs, stream);
++    } else {
++        tq_mm2_switch<type, 4>(NT, W0, Xp, Y, K, nrows, nb01, ncols, sy_col, gy, S, nbs, stream);
++    }
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// (TR multi-token round 4, GGML_CUDA_TQ_MM_V2=2) int8 variant of tq_mm2_kernel. VALUE-CHANGING beyond v1/v2: the
++// activations are quantised to int8 (absmax, one f32 scale per 32 values, as MMQ's q8_1 does) and multiplied against the
++// integer trits (u - L, exact in int8) with mma.sync m16n8k32 s8 x s8 -> s32 (twice the f16 rate). Per k32 step the s32
++// partial is scaled by d_row * s_x and accumulated in f32.
++// k-permutation inside a block for the m16n8k32 fragment layout: slot p -> step s = p >> 5, q = p & 31, half = q >> 4,
++// t = (q & 15) >> 2, e = q & 3, local index i = 8s + 4 half + e; (word, digit) of local index i as in tq_perm_src.
++
++static __device__ __forceinline__ int tq_perm8_src(const int p) {
++    const int s = p >> 5, q = p & 31, t = (q & 15) >> 2, i = 8*s + 4*(q >> 4) + (q & 3);
++    int w, d;
++    if (i < 30) { w = 6*t + i/5; d = i % 5; } else { w = 24 + (t >> 1); d = 2*(t & 1) + (i - 30); }
++    return d*TQD_NW + w;
++}
++
++// one warp per (column, group of 32 permuted slots): int8 values + f32 scale
++static __global__ void tq_f32_to_q8_perm(const char * __restrict__ src, int8_t * __restrict__ dq, float * __restrict__ ds,
++                                         const int64_t K, const int64_t nb11) {
++    const int64_t c = blockIdx.y;
++    const int64_t grp = (int64_t) blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
++    const int lane = threadIdx.x % WARP_SIZE;
++    if (grp*32 >= K) {
++        return;
++    }
++    const int64_t k = grp*32 + lane;
++    const int64_t blk = k / QK_TQD;
++    const float x = ((const float *) (src + c*nb11))[blk*QK_TQD + tq_perm8_src((int) (k % QK_TQD))];
++    float amax = fabsf(x);
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) {
++        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
++    }
++    const float inv = amax > 0.0f ? 127.0f/amax : 0.0f;
++    dq[c*K + k] = (int8_t) __float2int_rn(x*inv);
++    if (lane == 0) {
++        ds[c*(K/32) + grp] = amax/127.0f;
++    }
++}
++
++static __device__ __forceinline__ void tq_mma_s8(int c[4], const uint32_t a[4], const uint32_t b0, const uint32_t b1) {
++#ifdef AMPERE_MMA_AVAILABLE
++    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
++                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++#else
++    GGML_UNUSED_VARS(c, a, b0, b1);
++    NO_DEVICE_CODE;
++#endif
++}
++
++// one row's 32 values as 8 packed int8x4 (local order i): reg m = values 4m..4m+3
++template <int N, int W>
++static __device__ __forceinline__ void tq_mm3_decode_row(const uint32_t w[7], const int t, uint32_t pr[8]) {
++    constexpr uint32_t P1 = tq_pow<N, 1>::v, P2 = tq_pow<N, 2>::v, P3 = tq_pow<N, 3>::v, P4 = tq_pow<N, 4>::v;
++    uint32_t u[32];
++#pragma unroll
++    for (int c = 0; c < 6; ++c) {
++        const uint32_t X = W == 32 ? w[c] : w[c] << (32 - W);
++        u[5*c + 0] = __umulhi(X,    (uint32_t) N);
++        u[5*c + 1] = __umulhi(X*P1, (uint32_t) N);
++        u[5*c + 2] = __umulhi(X*P2, (uint32_t) N);
++        u[5*c + 3] = __umulhi(X*P3, (uint32_t) N);
++        u[5*c + 4] = __umulhi(X*P4, (uint32_t) N);
++    }
++    {
++        const uint32_t X  = W == 32 ? w[6] : w[6] << (32 - W);
++        const uint32_t Xs = (t & 1) ? X*P2 : X;
++        u[30] = __umulhi(Xs,    (uint32_t) N);
++        u[31] = __umulhi(Xs*P1, (uint32_t) N);
++    }
++    constexpr uint32_t L4 = (uint32_t) ((N - 1)/2) * 0x01010101u;
++#pragma unroll
++    for (int m = 0; m < 8; ++m) {
++        const uint32_t x = u[4*m] | (u[4*m + 1] << 8) | (u[4*m + 2] << 16) | (u[4*m + 3] << 24);
++        pr[m] = __vsub4(x, L4);
++    }
++}
++
++#define TQ_MM3_KS 144   // smem row stride in bytes (128 + 16: ldmatrix rows conflict-free)
++
++template <ggml_type type, int NT, int WM, bool AS>
++static __global__ void __launch_bounds__(WM*WARP_SIZE)
++tq_mm3_kernel(const char * __restrict__ W0, const int8_t * __restrict__ Xq, const float * __restrict__ Xs, float * __restrict__ Y,
++              const int64_t K, const int64_t nrows, const int64_t nb01, const int ncols, const int64_t sy_col,
++              const int nbs) {
++#ifdef AMPERE_MMA_AVAILABLE
++    typedef tq_traits<type> tr;
++    typedef typename tr::block block;
++    constexpr int N = tr::N, W = tr::W;
++    constexpr int NC = 8*NT;
++    constexpr int NTHR = WM*WARP_SIZE;
++
++    __shared__ __align__(16) int8_t Bs[2][NC*TQ_MM3_KS];
++    __shared__ float Ss[2][4][NC];   // [stage][k32 step][column]
++    extern __shared__ __align__(16) char tq_mm3_araw[];   // AS: [2][16*WM][RS] raw blocks
++    constexpr int ASTG = 16*WM*tq_araw<block>::RS;
++    char * const ARAW = tq_mm3_araw;
++
++    const int tid = threadIdx.x, warp = tid / WARP_SIZE, lane = tid % WARP_SIZE;
++    const int g = lane >> 2, t = lane & 3;
++    const int nb = (int) (K/QK_TQD);
++    const int64_t ng = K/32;
++    const int b0 = blockIdx.z*nbs, b1 = min(nb, b0 + nbs);
++    const int jb = blockIdx.y*NC, ncur = min(NC, ncols - jb);
++    const int64_t rA = (int64_t) blockIdx.x*(16*WM) + warp*16 + g;
++    const block * wr0 = (const block *) (W0 + min(rA,     nrows - 1)*nb01);
++    const block * wr1 = (const block *) (W0 + min(rA + 8, nrows - 1)*nb01);
++
++    auto issue_b = [&](const int b, const int s) {
++#pragma unroll
++        for (int c = tid; c < NC*8; c += NTHR) {
++            const int col = c >> 3, part = c & 7;
++            const bool v = col < ncur;
++            tq_cp_async16(&Bs[s][col*TQ_MM3_KS + part*16], Xq + (int64_t) (jb + (v ? col : 0))*K + (int64_t) b*QK_TQD + part*16, v);
++        }
++        for (int c = tid; c < NC; c += NTHR) {
++            const bool v = c < ncur;
++            float4 sc = v ? *(const float4 *) (Xs + (int64_t) (jb + c)*ng + (int64_t) b*4) : make_float4(0, 0, 0, 0);
++            Ss[s][0][c] = sc.x; Ss[s][1][c] = sc.y; Ss[s][2][c] = sc.z; Ss[s][3][c] = sc.w;
++        }
++        tq_cp_async_commit();
++    };
++
++    float acc[NT][4];
++#pragma unroll
++    for (int n = 0; n < NT; ++n) {
++        acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
++    }
++
++    uint32_t w0[7], w1[7];
++    half d0h, d1h;
++    const int64_t row_base = (int64_t) blockIdx.x*(16*WM);
++    if (b0 < b1) {
++        if constexpr (AS) {
++            tq_issue_araw<block, 16*WM, NTHR>(ARAW, W0, row_base, nrows, nb01, b0, tid);
++        }
++        issue_b(b0, 0);
++        if constexpr (!AS) {
++            tq_mm2_load_row<type>(wr0[b0], t, w0, d0h);
++            tq_mm2_load_row<type>(wr1[b0], t, w1, d1h);
++        }
++    }
++    const int lm = lane >> 3, lr = lane & 7;
++    const int boff = lr*TQ_MM3_KS + (lm >> 1)*32 + (lm & 1)*16;
++
++    for (int b = b0; b < b1; ++b) {
++        const int s = (b - b0) & 1;
++        if (b + 1 < b1) {
++            if constexpr (AS) {
++                tq_issue_araw<block, 16*WM, NTHR>(ARAW + (s ^ 1)*ASTG, W0, row_base, nrows, nb01, b + 1, tid);
++            }
++            issue_b(b + 1, s ^ 1);
++        }
++        if constexpr (AS) {   // raw words of block b come from the smem stage: wait for it first
++            if (b + 1 < b1) {
++                tq_cp_async_wait<1>();
++            } else {
++                tq_cp_async_wait<0>();
++            }
++            __syncthreads();
++            tq_mm2_load_row<type>(tq_araw_row<block>(ARAW + s*ASTG, warp*16 + g,     W0, min(rA,     nrows - 1), nb01, b), t, w0, d0h);
++            tq_mm2_load_row<type>(tq_araw_row<block>(ARAW + s*ASTG, warp*16 + g + 8, W0, min(rA + 8, nrows - 1), nb01, b), t, w1, d1h);
++        }
++        uint32_t a0[8], a1[8];
++        tq_mm3_decode_row<N, W>(w0, t, a0);
++        tq_mm3_decode_row<N, W>(w1, t, a1);
++        const float d0 = __half2float(d0h), d1 = __half2float(d1h);
++        if constexpr (!AS) {
++            if (b + 1 < b1) {
++                tq_mm2_load_row<type>(wr0[b + 1], t, w0, d0h);
++                tq_mm2_load_row<type>(wr1[b + 1], t, w1, d1h);
++                tq_cp_async_wait<1>();
++            } else {
++                tq_cp_async_wait<0>();
++            }
++            __syncthreads();
++        }
++
++        const int8_t * B = Bs[s] + boff;
++#pragma unroll
++        for (int ks = 0; ks < 4; ks += 2) {
++            // step ks: a = {row g k 4t.., row g+8 k 4t.., row g k 16+4t.., row g+8 k 16+4t..} = regs 2ks, 2ks+1
++            const uint32_t A0[4] = {a0[2*ks],     a1[2*ks],     a0[2*ks + 1], a1[2*ks + 1]};
++            const uint32_t A1[4] = {a0[2*ks + 2], a1[2*ks + 2], a0[2*ks + 3], a1[2*ks + 3]};
++#pragma unroll
++            for (int n = 0; n < NT; ++n) {
++                uint32_t bb[4];
++                tq_ldmatrix_x4(bb, (const half *) (B + n*8*TQ_MM3_KS + ks*32));
++                int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
++                tq_mma_s8(c0, A0, bb[0], bb[1]);
++                tq_mma_s8(c1, A1, bb[2], bb[3]);
++                const int cc0 = n*8 + 2*t, cc1 = cc0 + 1;
++                const float sa0 = Ss[s][ks][cc0],     sa1 = Ss[s][ks][cc1];
++                const float sb0 = Ss[s][ks + 1][cc0], sb1 = Ss[s][ks + 1][cc1];
++                acc[n][0] = fmaf(d0, fmaf(sa0, (float) c0[0], sb0*(float) c1[0]), acc[n][0]);
++                acc[n][1] = fmaf(d0, fmaf(sa1, (float) c0[1], sb1*(float) c1[1]), acc[n][1]);
++                acc[n][2] = fmaf(d1, fmaf(sa0, (float) c0[2], sb0*(float) c1[2]), acc[n][2]);
++                acc[n][3] = fmaf(d1, fmaf(sa1, (float) c0[3], sb1*(float) c1[3]), acc[n][3]);
++            }
++        }
++        __syncthreads();
++    }
++
++    float * out = Y;
++    int64_t cs = sy_col;
++    if (gridDim.z > 1) {
++        out = Y + (int64_t) blockIdx.z*ncols*nrows;
++        cs = nrows;
++    }
++    const int64_t r0 = rA, r1 = rA + 8;
++#pragma unroll
++    for (int n = 0; n < NT; ++n) {
++        const int c0 = n*8 + 2*t, c1 = c0 + 1;
++        if (r0 < nrows) {
++            if (c0 < ncur) out[(jb + c0)*cs + r0] = acc[n][0];
++            if (c1 < ncur) out[(jb + c1)*cs + r0] = acc[n][1];
++        }
++        if (r1 < nrows) {
++            if (c0 < ncur) out[(jb + c0)*cs + r1] = acc[n][2];
++            if (c1 < ncur) out[(jb + c1)*cs + r1] = acc[n][3];
++        }
++    }
++#else
++    GGML_UNUSED_VARS(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, nbs);
++    NO_DEVICE_CODE;
++#endif // AMPERE_MMA_AVAILABLE
++}
++
++template <ggml_type type, int NT, int WM>
++static void tq_mm3_launch(const char * W0, const int8_t * Xq, const float * Xs, float * Y, int64_t K, int64_t nrows, int64_t nb01,
++                          int ncols, int64_t sy_col, int gy, int S, int nbs, cudaStream_t stream) {
++    const dim3 grid((unsigned) ((nrows + 16*WM - 1)/(16*WM)), (unsigned) gy, (unsigned) S);
++    if (tq_mm2_as()) {
++        const int dyn = 2*16*WM*tq_araw<typename tq_traits<type>::block>::RS;
++        static bool attr = false;
++        if (!attr) {
++            CUDA_CHECK(cudaFuncSetAttribute(tq_mm3_kernel<type, NT, WM, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn));
++            attr = true;
++        }
++        tq_mm3_kernel<type, NT, WM, true><<<grid, WM*WARP_SIZE, dyn, stream>>>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, nbs);
++    } else {
++        tq_mm3_kernel<type, NT, WM, false><<<grid, WM*WARP_SIZE, 0, stream>>>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, nbs);
++    }
++}
++
++template <ggml_type type, int WM>
++static void tq_mm3_switch(int NT, const char * W0, const int8_t * Xq, const float * Xs, float * Y, int64_t K, int64_t nrows,
++                          int64_t nb01, int ncols, int64_t sy_col, int gy, int S, int nbs, cudaStream_t stream) {
++#define TQ_MM3_CASE(n) case n: tq_mm3_launch<type, n, WM>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, gy, S, nbs, stream); break;
++    switch (NT) {
++        TQ_MM3_CASE(1) TQ_MM3_CASE(2) TQ_MM3_CASE(3) TQ_MM3_CASE(4) TQ_MM3_CASE(5) TQ_MM3_CASE(6) TQ_MM3_CASE(7) TQ_MM3_CASE(8)
++        default: tq_mm3_launch<type, 9, WM>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, gy, S, nbs, stream); break;
++    }
++#undef TQ_MM3_CASE
++}
++
++template <ggml_type type>
++static void tq_mm3_dispatch(int WM, int NT, const char * W0, const int8_t * Xq, const float * Xs, float * Y, int64_t K,
++                            int64_t nrows, int64_t nb01, int ncols, int64_t sy_col, int gy, int S, int nbs, cudaStream_t stream) {
++    if (WM == 8) {
++        tq_mm3_switch<type, 8>(NT, W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, gy, S, nbs, stream);
++    } else {
++        tq_mm3_switch<type, 4>(NT, W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, gy, S, nbs, stream);
++    }
++}
++
++// dense only (ids == nullptr), called after ggml_cuda_tq_mm_supports passed
++static bool tq_mul_mat_mm2(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    cudaStream_t stream = ctx.stream();
++    const int64_t K = src0->ne[0], nrows = src0->ne[1];
++    const int ncols = (int) src1->ne[1];
++    const int nb = (int) (K/QK_TQD);
++
++    const bool i8 = tq_mm_v2() == 2;   // int8 activations (value-changing variant)
++    if (!i8 && src0->type == GGML_TYPE_TQ9_128 && nrows >= 65536 && ncols <= 32) {
++        return false;   // lm_head-size TQ9 at <= 32 columns: the v1 kernel is 3-5 % faster (round-4 op perf); caller falls back
++    }
++    tq_mm2_as_cur = tq_mm2_as_env() >= 0 ? tq_mm2_as_env() :
++        (nrows >= 65536 || (!i8 && src0->type != GGML_TYPE_TQ9_128)) ? 1 : 0;
++    ggml_cuda_pool_alloc<half>   xp(ctx.pool());
++    ggml_cuda_pool_alloc<int8_t> xq(ctx.pool());
++    ggml_cuda_pool_alloc<float>  xs(ctx.pool());
++    if (i8) {
++        xq.alloc((int64_t) ncols*K);
++        xs.alloc((int64_t) ncols*(K/32));
++        const dim3 grid((unsigned) ((K/32 + 7)/8), (unsigned) ncols, 1);
++        tq_f32_to_q8_perm<<<grid, 256, 0, stream>>>((const char *) src1->data, xq.get(), xs.get(), K, src1->nb[1]);
++    } else {
++        xp.alloc((int64_t) ncols*K);
++        const dim3 grid((unsigned) std::min<int64_t>((K + 255)/256, 16), (unsigned) ncols, 1);
++        tq_f32_to_f16_perm<<<grid, 256, 0, stream>>>((const char *) src1->data, xp.get(), K, src1->nb[1]);
++    }
++
++    static const int wm_env = tq_env("GGML_CUDA_TQ_MM2_WM", 0);
++    static const int s_env  = tq_env("GGML_CUDA_TQ_MM2_S", 0);
++    static const int ntmax  = std::max(1, std::min(9, tq_env("GGML_CUDA_TQ_MM2_NTMAX", 9)));
++    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
++    const int NT = std::min(ntmax, (ncols + 7)/8);
++    const int gy = (ncols + 8*NT - 1)/(8*NT);
++    const int WM = wm_env ? wm_env : 4;
++    const int64_t ctas = (nrows + 16*WM - 1)/(16*WM)*gy;
++    int S = s_env;
++    if (S <= 0) {   // round-4 sweep (WM 4/8 x S 1-6, GB10): split K in 3 below 2 CTAs per SM, keeping >= 4 blocks per split
++        S = ctas >= 2*nsm ? 1 : std::max(1, std::min(3, nb/4));
++    }
++    S = std::max(1, std::min(S, nb));
++    const int nbs = (nb + S - 1)/S;
++    S = (nb + nbs - 1)/nbs;
++
++    const char * W0 = (const char *) src0->data;
++    float * Y = (float *) dst->data;
++    const int64_t sy_col = dst->nb[1]/sizeof(float);
++    ggml_cuda_pool_alloc<float> part(ctx.pool());
++    float * out = Y;
++    if (S > 1) {
++        part.alloc((int64_t) S*ncols*nrows);
++        out = part.get();
++    }
++    if (i8) {
++        switch (src0->type) {
++            case GGML_TYPE_TQ9_128:  tq_mm3_dispatch<GGML_TYPE_TQ9_128> (WM, NT, W0, xq.get(), xs.get(), out, K, nrows, src0->nb[1], ncols, sy_col, gy, S, nbs, stream); break;
++            case GGML_TYPE_TQ27_128: tq_mm3_dispatch<GGML_TYPE_TQ27_128>(WM, NT, W0, xq.get(), xs.get(), out, K, nrows, src0->nb[1], ncols, sy_col, gy, S, nbs, stream); break;
++            case GGML_TYPE_TQ81_128: tq_mm3_dispatch<GGML_TYPE_TQ81_128>(WM, NT, W0, xq.get(), xs.get(), out, K, nrows, src0->nb[1], ncols, sy_col, gy, S, nbs, stream); break;
++            default: return false;
++        }
++    } else switch (src0->type) {
++        case GGML_TYPE_TQ9_128:  tq_mm2_dispatch<GGML_TYPE_TQ9_128> (WM, NT, W0, xp.get(), out, K, nrows, src0->nb[1], ncols, sy_col, gy, S, nbs, stream); break;
++        case GGML_TYPE_TQ27_128: tq_mm2_dispatch<GGML_TYPE_TQ27_128>(WM, NT, W0, xp.get(), out, K, nrows, src0->nb[1], ncols, sy_col, gy, S, nbs, stream); break;
++        case GGML_TYPE_TQ81_128: tq_mm2_dispatch<GGML_TYPE_TQ81_128>(WM, NT, W0, xp.get(), out, K, nrows, src0->nb[1], ncols, sy_col, gy, S, nbs, stream); break;
++        default: return false;
++    }
++    if (S > 1) {
++        const dim3 grid((unsigned) ((nrows + 255)/256), (unsigned) ncols, 1);
++        tq_mm2_reduce<<<grid, 256, 0, stream>>>(part.get(), Y, nrows, ncols, sy_col, S);
++    }
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
++
+ int ggml_cuda_tq_mm_mode() {
+     static int v = tq_env("GGML_CUDA_TQ_MM", 1);   // default on (v3, 2026-11-20, value-changing); GGML_CUDA_TQ_MM=0 = exact MT path
+     return v;
+@@ -1118,6 +1814,9 @@ bool ggml_cuda_tq_mul_mat_mm(ggml_backend_cuda_context & ctx, const ggml_tensor
+     if (!ggml_cuda_tq_mm_supports(src0, src1, ids, dst)) {
+         return false;
+     }
++    if (!ids && tq_mm_v2() && tq_mul_mat_mm2(ctx, src0, src1, dst)) {
++        return true;
++    }
+     cudaStream_t stream = ctx.stream();
+     const int64_t K = src0->ne[0], nrows = src0->ne[1];
+     const int64_t ne11 = src1->ne[1], ne12 = src1->ne[2];
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 48dffbb1c..5917e2926 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11101,6 +11101,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ27_128, GGML_TYPE_F32, 512, 10, false, 2560, 1, 640)); // qwen4exp experts
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ27_128, GGML_TYPE_F32, 512, 10, false, 2560, 4, 640)); // qwen4exp experts
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ27_128, GGML_TYPE_F32, 512, 10, false, 2560, 33, 640)); // qwen4exp experts
++    // (TR round 4) tensor-core mat-mat shapes: odd row counts, column tails, gy > 1, split-K edges (nb = 3, 16, 32)
++    for (ggml_type type_a : {GGML_TYPE_TQ9_128, GGML_TYPE_TQ27_128, GGML_TYPE_TQ81_128}) {
++        for (int n : {8, 9, 16, 17, 33, 65, 80, 100}) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2056, n, 2048, {1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, n, 4096, {1, 1}, {1, 1}));
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 8200, n,  384, {1, 1}, {1, 1}));
++        }
++    }
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ27_128, GGML_TYPE_F32, 10240, 1, 2560, {1, 1}, {1, 1})); // qwen4exp dense
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ27_128, GGML_TYPE_F32, 10240, 3, 2560, {1, 1}, {1, 1})); // qwen4exp dense
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ27_128, GGML_TYPE_F32, 10240, 8, 2560, {1, 1}, {1, 1})); // qwen4exp dense
+@@ -12138,10 +12146,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+ 
+     // (TR multi-token, 11-19) draft-verify shapes, 1-65 tokens: TQ vs Q4_K (env TBO_MT_ONLY=1 runs only these)
+     for (ggml_type type_a : {GGML_TYPE_TQ9_128, GGML_TYPE_TQ27_128, GGML_TYPE_Q4_K}) {
+-        for (int bs : {1, 2, 4, 8, 16, 32, 65}) {
++        for (int bs : {1, 2, 4, 8, 9, 16, 32, 65}) {
+             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false,  512, bs, 2048)); // experts gate / up
+             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, bs,  512)); // experts down
+-            for (auto mk : std::vector<std::array<int64_t, 2>>{{8192, 2048}, {2048, 4096}, {512, 2048}, {248320, 2048}}) {
++            for (auto mk : std::vector<std::array<int64_t, 2>>{{8192, 2048}, {4096, 2048}, {2048, 4096}, {512, 2048}, {248320, 2048}}) {
+                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk[0], bs, mk[1], {1, 1}, {1, 1}));
+             }
+         }
+-- 
+2.54.0 (Apple Git-157)
+

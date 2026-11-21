@@ -17,14 +17,16 @@ patches.
 | `0009` ggml-cuda: dense trit kernels | dequantisation (bit-identical to the CPU reference), mat-vec for 1-8 columns for MUL_MAT and MUL_MAT_ID (expert ids read on the device, so CUDA graphs keep working), GET_ROWS, and fp16 / bf16 / fp32 conversion for the cuBLAS path above 8 columns. Built and tested on a DGX Spark (GB10, sm_121, CUDA 13.0) only | always in CUDA builds |
 | `0010` ggml-cpu: AVX2 dot product (x86) | the TQ x Q8_0 dot product with AVX2 instead of the 0001 scalar code; bitwise identical to it with the same compiler flags (checked by `tools/tq_exact/` in the patched tree). No repacked kernels on x86 | x86 with AVX2 |
 | `0011` ggml-cuda: multi-token paths | `GGML_CUDA_TQ_MT`: grouped MoE mat-vec for 2-8 tokens without host syncs, exact against single-token decode on MoE layers (dense layers above 8 columns stay on cuBLAS unless `GGML_CUDA_TQ_MT_DENSE=1`). `GGML_CUDA_TQ_MM`: tensor-core mat-mat for prompts and long verify passes. **MM is value-changing**: outputs differ from `GGML_CUDA_TQ_MM=0`. DGX Spark, llama-bench pp2048, MM off -> on: 35B 1,387 -> 1,924, Qwen3.8-Flash-Next 607 -> 806 tok/s; decode level. Accuracy, MM on vs off (llama.cpp server, greedy, n-gram drafting): 35B GSM8K 90.83 vs 90.60, HumanEval+ 91.46 vs 92.68, MBPP+ 91.53 vs 91.27; Qwen3.8-Flash-Next GSM8K 92.80 vs 93.25; no significant difference (all p ≥ 0.33) | both on; `GGML_CUDA_TQ_MT=0`, `GGML_CUDA_TQ_MM=0` |
+| `0012` ggml-cuda: mat-mat v4 | `GGML_CUDA_TQ_MM_V2`: a second tensor-core mat-mat kernel for the dense (non-MoE) layers, used when `GGML_CUDA_TQ_MM` is on. **Value-changing**: outputs differ from `GGML_CUDA_TQ_MM_V2=0` (0011's mat-mat). DGX Spark, llama-bench: prompt processing about 3 % faster than 0011's mat-mat on both models (pp512 / pp2048 ×1.03 on the 35B, ×1.025 on Qwen3.8-Flash-Next), decode level. Accuracy, 0012 vs 0011 mat-mat (llama.cpp server, greedy, n-gram drafting): 35B GSM8K 90.37 vs 90.83, HumanEval+ 92.07 vs 91.46, MBPP+ 91.27 vs 91.53; Qwen3.8-Flash-Next GSM8K 92.80 vs 92.80; no significant difference (all p ≥ 0.24) | on; `GGML_CUDA_TQ_MM_V2=0` gives 0011's mat-mat |
 
 ## Ready-built binaries
 
-No build needed: the [`llama.cpp-tr-b11721-r4` release](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r4) has this series
-(0001-0011 on `ff5a233`) built for **macOS arm64** (Apple silicon, macOS 13.3+, Metal; CPU code for M1 / M2-M3 / M4+ picked at run time) and
+No build needed: the [`llama.cpp-tr-b11721-r5` release](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r5) has this series
+(0001-0012 on `ff5a233`) built for **macOS arm64** (Apple silicon, macOS 13.3+, Metal; CPU code for M1 / M2-M3 / M4+ picked at run time) and
 **Linux arm64** (glibc 2.39+, e.g. Ubuntu 24.04 / DGX OS; CPU code for armv8.0 ... armv9.2 + SME picked at run time, plus CUDA for the
 DGX Spark, sm_121, which needs the CUDA 13 runtime; without it the CPU is used). There is no x86-64 archive: build from source with `apply.sh`.
-Earlier releases: [r3](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r3) (0001-0007, macOS arm64),
+Earlier releases: [r4](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r4) (0001-0011, macOS and Linux arm64; the Mac one-line installers use it),
+[r3](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r3) (0001-0007, macOS arm64),
 [r2](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r2) (0001-0006, macOS and Linux arm64, CPU only).
 Each archive has `llama-server` (with the web UI), `llama-cli`, `llama-completion`, `llama-bench`, `llama-perplexity` and `test-backend-ops`.
 The run lines below work with them as they are (`./llama-server` in the unpacked folder instead of `./build/bin/llama-server`).
@@ -112,8 +114,8 @@ in the request, or raise `max_tokens`. These switches are standard llama.cpp opt
   accuracy has not been measured: set `LLAMA_MOE_EXPERTS=0` to keep 10 experts there. `LLAMA_MOE_PRED=0 GGML_METAL_MOE_SPIN=0
   LLAMA_MOE_EXPERTS=0` gives 0004's behaviour back. Run Macs on 0007 under `caffeinate -ims` (or another power assertion): without it the
   base M5's GPU clocks down and decode is much slower.
-- **CUDA (0009, 0011) has been built and tested on a DGX Spark (GB10, sm_121, CUDA 13.0) only.** There, with n-gram drafting on code
-  edits, the 35B is still slower than Q4_K_M (136.6 vs 145.2 tok/s); on maths, chat and documents it is ahead. `GGML_CUDA_TQ_MM=0
+- **CUDA (0009, 0011, 0012) has been built and tested on a DGX Spark (GB10, sm_121, CUDA 13.0) only.** There, with n-gram drafting on code
+  edits, the 35B is level with Q4_K_M since 0012 (149.9 vs 148.0 tok/s, 6 passes; 139.2 with 0011's mat-mat); on maths, chat and documents it is ahead. `GGML_CUDA_TQ_MM=0
   GGML_CUDA_TQ_MT=0` gives 0009's plain kernels back.
 - The fast CPU path (0005) is aarch64 only. x86 gets 0010's AVX2 dot product (exact, not repacked); its speed is not published here.
 - `test-backend-ops` does not exercise 0005's repacked path (it never places weights in the CPU repack buffer), so a passing CPU run there does not test it.

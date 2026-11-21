@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # Builds the Linux arm64 release archive inside ubuntu:24.04 (glibc 2.39; gcc 14, needed for the armv9.2 + SME variants):
 # CPU code as armv8.0 ... armv9.2 variants picked at run time (GGML_BACKEND_DL), OpenMP off (no libgomp dependency),
-# BoringSSL linked statically, rpath $ORIGIN; plus the CUDA backend (0009 / 0011) for sm_121 (DGX Spark, GB10), compiled with the
+# BoringSSL linked statically, rpath $ORIGIN; plus the CUDA backend (0009 / 0011 / 0012) for sm_121 (DGX Spark, GB10), compiled with the
 # host's CUDA 13.0 toolkit mounted read-only. libggml-cuda.so needs the CUDA 13 runtime (libcudart, libcublas) on the machine;
 # without a GPU or the runtime, llama.cpp falls back to the CPU.
 # usage (on an arm64 host with Docker and /usr/local/cuda-13.0): [JOBS=n] [DOCKER_OPTS=...] [IMAGE=arm64 ubuntu:24.04 image] ./build_linux_arm64.sh [work dir, default ./build-linux]
