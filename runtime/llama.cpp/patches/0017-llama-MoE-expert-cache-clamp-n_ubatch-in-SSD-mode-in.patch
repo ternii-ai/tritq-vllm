@@ -1,0 +1,131 @@
+From 47e59a912676cbc6fd5bb4227f3fb0d0ce0a51b5 Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 23:54:09 +0000
+Subject: [PATCH] llama: MoE expert cache: clamp n_ubatch in SSD mode instead
+ of aborting
+
+With LLAMA_MOE_SSD=1 a ubatch larger than LLAMA_MOE_CACHE_MAX_BATCH (or
+than the cache slots can hold) aborted at context creation, because the
+SSD mode has no fallback path for large ubatches. Callers that pass a
+larger -ub (Ollama sends 1024 or 2048) crashed the server.
+
+The context now clamps n_ubatch to the largest ubatch the cache takes and
+logs a warning; llama_decode splits larger batches into ubatches of at
+most that size. The ubatches, and so the output, are the same as running
+with -ub at the limit. Nothing changes when the cache is off, outside SSD
+mode, or when -ub is already within the limit.
+
+In SSD mode LLAMA_MOE_CACHE_MAX_BATCH now defaults to 512, llama-server's
+default -ub, instead of 32, so LLAMA_MOE_SSD=1 alone runs prefill in
+ubatches of 512 rather than 32. Without SSD the default stays 32: there
+it only decides which ubatches use the cache, and larger ones fall back
+to the host experts. An explicit LLAMA_MOE_CACHE_MAX_BATCH is unchanged.
+---
+ src/llama-context.cpp   |  7 +++++++
+ src/llama-moe-cache.cpp | 27 +++++++++++++++++++++++++--
+ src/llama-moe-cache.h   |  5 +++++
+ 3 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f709464b2..6e2ea6d63 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -574,6 +574,13 @@ llama_context::llama_context(
+                 cparams.moe_cache_size = new_sz;
+             }
+             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
++            // (tq expert cache) the SSD mode has no path for ubatches larger than the cache takes (it used to abort): clamp n_ubatch,
++            // so larger batches are split into ubatches the cache takes - the same ubatches, and so the same output, as -ub at the limit
++            if (const int64_t mu = moe_cache->max_ubatch(); mu > 0 && (int64_t) cparams.n_ubatch > mu) {
++                LLAMA_LOG_WARN("%s: n_ubatch %u -> %lld: the MoE expert cache (SSD mode) takes at most %lld tokens per ubatch "
++                    "(LLAMA_MOE_CACHE_MAX_BATCH and the cache slots set the limit)\n", __func__, cparams.n_ubatch, (long long) mu, (long long) mu);
++                cparams.n_ubatch = (uint32_t) mu;
++            }
+         }
+ 
+         sched_reserve();
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index ebc50f3d5..79be3f11d 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -321,7 +321,8 @@ struct llama_moe_cache::impl {
+         size_t bytes  = 0;
+     };
+ 
+-    // upstream 32; LLAMA_MOE_CACHE_MAX_BATCH raises it so prefill also goes through the cache (as in the offload simulation)
++    // upstream 32; LLAMA_MOE_CACHE_MAX_BATCH raises it so prefill also goes through the cache (as in the offload simulation).
++    // The SSD mode defaults to 512 (llama-server's default -ub): it has no fallback for larger ubatches, so n_ubatch is clamped to it
+     int64_t max_batch = 32;
+ 
+     // (tq expert cache) LLAMA_MOE_SSD=1: misses are read from the model file with pread (F_NOCACHE), not copied from host memory
+@@ -438,7 +439,6 @@ struct llama_moe_cache::impl {
+ 
+     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+-        max_batch = moe_env_long("LLAMA_MOE_CACHE_MAX_BATCH", 32);
+         // prefetch is on by default (it only acts with the SSD async cache, see pred_k()); 6 experts measured best on a 16 GB MacBook Air
+         pred_mode = (int) moe_env_long("LLAMA_MOE_PRED", 2);
+         pred_k_   = pred_mode > 0 ? (int32_t) moe_env_long("LLAMA_MOE_PRED_K", 6) : 0;
+@@ -453,6 +453,7 @@ struct llama_moe_cache::impl {
+             trace_fp = fopen(tp, "wb");
+         }
+         ssd       = moe_env_long("LLAMA_MOE_SSD", 0) != 0;
++        max_batch = moe_env_long("LLAMA_MOE_CACHE_MAX_BATCH", ssd ? 512 : 32);
+         ssd_chunk = std::min((size_t) moe_env_long("LLAMA_MOE_SSD_CHUNK", (long) ssd_chunk), (size_t) 1u << 20);
+         layer_miss_small.assign(model.layers.size(), 0);
+         packed.resize(model.layers.size());
+@@ -1092,6 +1093,24 @@ struct llama_moe_cache::impl {
+         return l.slot_map;
+     }
+ 
++    int64_t max_ubatch() const {
++        if (!ssd) {
++            return 0;
++        }
++        // get_slot_map takes n_tokens <= max_batch with min(n_tokens*n_expert_used, n_expert) <= n_slots
++        int64_t n = max_batch;
++        for (const layer & l : layers) {
++            if (l.ig < 0) {
++                continue;
++            }
++            const int64_t n_slots = groups[l.ig].n_slots;
++            if (n_slots < l.slot_map->ne[1]) {
++                n = std::min(n, n_slots / std::max<int64_t>(n_expert_used, 1));
++            }
++        }
++        return std::max<int64_t>(n, 1);
++    }
++
+     ggml_tensor * get_experts(const ggml_tensor * w) const {
+         const auto it = bindings.find(w);
+         return it != bindings.end() ? it->second.cached : nullptr;
+@@ -1474,6 +1493,10 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
+     return pimpl->get_experts(w);
+ }
+ 
++int64_t llama_moe_cache::max_ubatch() const {
++    return pimpl->max_ubatch();
++}
++
+ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+     return pimpl->copy(backend, src, dst, graph);
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index f70a479f4..c1c542599 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -29,6 +29,11 @@ public:
+     // the experts of w in the cache, nullptr if w is not cached
+     ggml_tensor * get_experts(const ggml_tensor * w) const;
+ 
++    // (tq expert cache) the largest ubatch every cached layer can take through the cache, 0 if there is no limit. Only the SSD
++    // mode has a limit: it has no fallback for larger ubatches (that would read the host experts through the mapping), so the
++    // context clamps n_ubatch to it and llama_decode splits larger batches into ubatches of at most this many tokens
++    int64_t max_ubatch() const;
++
+     // ggml_backend_sched copy callback, returns false if src is not a slot map
+     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph);
+ 
+-- 
+2.54.0 (Apple Git-157)
+

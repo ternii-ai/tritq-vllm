@@ -6,9 +6,11 @@ Subject: [PATCH 4/4] llama: MoE expert cache backed by the model file
 
 Keeps routed expert weights in the GGUF file and reads only the experts
 the router selects into a fixed bank of slots in GPU-visible memory, with
-LRU replacement per layout group. Output is unchanged versus the fully
-resident model (raw-logit gate). For machines whose memory cannot hold all
-experts. Budget: LLAMA_MOE_CACHE_MIB. Stats: LLAMA_MOE_STATS=path.
+LRU replacement per layout group. Greedy output matched the fully resident
+model in our tests; logits differ slightly because Metal fuses a few
+operations differently at the cache's graph splits. For machines whose
+memory cannot hold all experts. Budget: LLAMA_MOE_CACHE_MIB. Stats:
+LLAMA_MOE_STATS=path.
 ---
  ggml/src/ggml-backend.cpp                 |  10 +-
  ggml/src/ggml-metal/ggml-metal-common.cpp |   3 +-

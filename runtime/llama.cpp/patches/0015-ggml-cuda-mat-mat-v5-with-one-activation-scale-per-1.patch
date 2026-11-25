@@ -1,0 +1,215 @@
+From 58116f15c53c24742a5c007d69c9d2d7c159c6ef Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 17:48:05 +0000
+Subject: [PATCH] ggml-cuda: mat-mat v5 with one activation scale per 128 for
+ the dense trit types (GGML_CUDA_TQ_MM_V2=4, opt-in)
+
+Quantise the activations to int8 with one absmax scale per 128-value block (one
+TQ block) instead of one per 32. The four k32 int8 MMAs of a block then
+accumulate in int32 (exact: |sum| <= 128 * 40 * 127), and the epilogue does
+one int-to-float conversion and one FMA per output per block instead of per
+k32 step.
+
+- New quantiser tq_f32_to_q8_perm128 (same permuted k order and rounding as
+  tq_f32_to_q8_perm; the block scale is written to all four per-32 slots, so
+  the scale layout and the v4 int8 fallback stay unchanged).
+- tq_mm8_kernel gets a compile-time switch for the per-block epilogue; v5's
+  tiles, pipeline, K chunks and reduction are unchanged.
+- Value-changing relative to V2=2/3 (int8, per-32 scales) and to the default
+  V2=1 (f16 activations). Off by default; V2=0..3 produce the same bytes as
+  before.
+---
+ ggml/src/ggml-cuda/tq.cu | 94 +++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 82 insertions(+), 12 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/tq.cu b/ggml/src/ggml-cuda/tq.cu
+index 9d23aa27b..3a7990849 100644
+--- a/ggml/src/ggml-cuda/tq.cu
++++ b/ggml/src/ggml-cuda/tq.cu
+@@ -1627,7 +1627,8 @@ static int tq_mm2_as() {
+ }
+ 
+ static int tq_mm_v2() {
+-    static int v = tq_env("GGML_CUDA_TQ_MM_V2", 1);   // default on (v4, r5): =1 f16 mat-mat v4, =0 v3 mat-mat (r4), =2 int8 variant (not gated), =3 int8 v5 (same values as 2)
++    static int v = tq_env("GGML_CUDA_TQ_MM_V2", 1);   // default on (v4, r5): =1 f16 mat-mat v4, =0 v3 mat-mat (r4), =2 int8 variant (not gated), =3 int8 v5 (same values as 2),
++                                                       // =4 int8 v5 with one activation scale per 128 (P3, value-changing vs 2/3)
+     return v;
+ }
+ 
+@@ -1708,6 +1709,39 @@ static __global__ void tq_f32_to_q8_perm(const char * __restrict__ src, int8_t *
+     }
+ }
+ 
++// (K1 P3, GGML_CUDA_TQ_MM_V2=4) as tq_f32_to_q8_perm, but one absmax scale per 128-value block (one TQ block): one warp
++// per (column, block), lane l quantises permuted slots l, l + 32, l + 64, l + 96. The scale is written to all four
++// per-32 slots of the block so the layout (and every consumer of it) stays the same as the per-32 variant.
++static __global__ void tq_f32_to_q8_perm128(const char * __restrict__ src, int8_t * __restrict__ dq, float * __restrict__ ds,
++                                            const int64_t K, const int64_t nb11) {
++    const int64_t c = blockIdx.y;
++    const int64_t blk = (int64_t) blockIdx.x*(blockDim.x/WARP_SIZE) + threadIdx.x/WARP_SIZE;
++    const int lane = threadIdx.x % WARP_SIZE;
++    if (blk*QK_TQD >= K) {
++        return;
++    }
++    const float * xr = (const float *) (src + c*nb11) + blk*QK_TQD;
++    float x[4];
++    float amax = 0.0f;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        x[j] = xr[tq_perm8_src(32*j + lane)];
++        amax = fmaxf(amax, fabsf(x[j]));
++    }
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) {
++        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
++    }
++    const float inv = amax > 0.0f ? 127.0f/amax : 0.0f;
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++        dq[c*K + blk*QK_TQD + 32*j + lane] = (int8_t) __float2int_rn(x[j]*inv);
++    }
++    if (lane < 4) {
++        ds[c*(K/32) + blk*4 + lane] = amax/127.0f;
++    }
++}
++
+ static __device__ __forceinline__ void tq_mma_s8(int c[4], const uint32_t a[4], const uint32_t b0, const uint32_t b1) {
+ #ifdef AMPERE_MMA_AVAILABLE
+     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+@@ -2078,7 +2112,7 @@ static __device__ __forceinline__ int tq8_ost(const int c, const int r) {
+     return c*BM + (r ^ ((4*c) & (BM - 1)));
+ }
+ 
+-template <ggml_type type, int MI, int NI, int CWM, int CWN, int PW, int DR, int E, bool SO>
++template <ggml_type type, int MI, int NI, int CWM, int CWN, int PW, int DR, int E, bool SO, bool A1>
+ static __global__ void __launch_bounds__(32*(CWM*CWN + PW), 1)
+ tq_mm8_kernel(const char * __restrict__ W0, const int8_t * __restrict__ Xq, const float * __restrict__ Xs, float * __restrict__ Y,
+               const int64_t K, const int64_t nrows, const int64_t nb01, const int ncols, const int64_t sy_col,
+@@ -2313,6 +2347,28 @@ tq_mm8_kernel(const char * __restrict__ W0, const int8_t * __restrict__ Xq, cons
+             dlo[mi] = Ds[rw + mi*16 + g];
+             dhi[mi] = Ds[rw + mi*16 + g + 8];
+         }
++        if constexpr (A1) {   // P3: one activation scale per block -> the 4 k32 IMMAs accumulate in int32, one rescale per block
++#pragma unroll
++        for (int ni = 0; ni < NI; ++ni) {
++            const int cc0 = cw + ni*8 + 2*t;
++            const float s0 = Ss[4*cc0], s1 = Ss[4*(cc0 + 1)];
++            uint32_t b0[4], b1[4];
++            tq_ldmatrix_x4(b0, (const half *) (Bs + tq5_sw(cw + ni*8 + lr, lm)));
++            tq_ldmatrix_x4(b1, (const half *) (Bs + tq5_sw(cw + ni*8 + lr, 4 + lm)));
++#pragma unroll
++            for (int mi = 0; mi < MI; ++mi) {
++                int c[4] = {0, 0, 0, 0};
++                tq_mma_s8(c, af[mi][0], b0[0], b0[1]);
++                tq_mma_s8(c, af[mi][1], b0[2], b0[3]);
++                tq_mma_s8(c, af[mi][2], b1[0], b1[1]);
++                tq_mma_s8(c, af[mi][3], b1[2], b1[3]);
++                acc[mi][ni][0] = fmaf(dlo[mi]*s0, (float) c[0], acc[mi][ni][0]);
++                acc[mi][ni][1] = fmaf(dlo[mi]*s1, (float) c[1], acc[mi][ni][1]);
++                acc[mi][ni][2] = fmaf(dhi[mi]*s0, (float) c[2], acc[mi][ni][2]);
++                acc[mi][ni][3] = fmaf(dhi[mi]*s1, (float) c[3], acc[mi][ni][3]);
++            }
++        }
++        } else {
+ #pragma unroll
+         for (int ni = 0; ni < NI; ++ni) {
+             const int cc0 = cw + ni*8 + 2*t;
+@@ -2336,6 +2392,7 @@ tq_mm8_kernel(const char * __restrict__ W0, const int8_t * __restrict__ Xq, cons
+                 }
+             }
+         }
++        }
+ 
+         if constexpr (!SO) {
+             tq7_bar_arrive(TQ7_BAR_EMPTY + (s & 1), NTHR);  // done with A(s); direct stores below must not hold the producers
+@@ -2399,14 +2456,14 @@ tq_mm8_kernel(const char * __restrict__ W0, const int8_t * __restrict__ Xq, cons
+ #endif // AMPERE_MMA_AVAILABLE
+ }
+ 
+-template <ggml_type type, int MI, int NI, int CWM, int CWN, int PW, int DR, int E, bool SO>
++template <ggml_type type, int MI, int NI, int CWM, int CWN, int PW, int DR, int E, bool SO, bool A1 = false>
+ static bool tq_mm8_launch(const char * W0, const int8_t * Xq, const float * Xs, float * Y, int64_t K, int64_t nrows,
+                           int64_t nb01, int ncols, int64_t sy_col, int S, int nbs, cudaStream_t stream) {
+     typedef tq8_cfg<type, MI, NI, CWM, CWN, PW, DR, E, SO> cfg;
+     if (cfg::SMEM > 101376) {   // GB10 / sm_12x: 99 KB dynamic shared memory per block
+         return false;
+     }
+-    auto kern = tq_mm8_kernel<type, MI, NI, CWM, CWN, PW, DR, E, SO>;
++    auto kern = tq_mm8_kernel<type, MI, NI, CWM, CWN, PW, DR, E, SO, A1>;
+     static int occ = -1;
+     if (occ < 0) {
+         CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, cfg::SMEM));
+@@ -2433,7 +2490,7 @@ static bool tq_mm8_launch(const char * W0, const int8_t * Xq, const float * Xs,
+ //  - smaller ncols: 64 x 16*NI tiles, direct stores, deeper raw/activation pipelines.
+ // Returns false (caller runs v4 int8, same values) if the weights are not 16-byte aligned.
+ #define TQ5_BIG 113
+-template <ggml_type type>
++template <ggml_type type, bool A1 = false>
+ static bool tq_mm5_dispatch(const char * W0, const int8_t * Xq, const float * Xs, float * Y, int64_t K, int64_t nrows,
+                             int64_t nb01, int ncols, int64_t sy_col, int S, int nbs, cudaStream_t stream) {
+     if (((uintptr_t) W0 & 15) != 0 || (nb01 & 1) != 0) {
+@@ -2447,18 +2504,18 @@ static bool tq_mm5_dispatch(const char * W0, const int8_t * Xq, const float * Xs
+         const double e64 = (double) w64/(double) (((w64 + nsm - 1)/nsm)*nsm);
+         const double e32 = (double) w32/(double) (((w32 + nsm - 1)/nsm)*nsm);
+         if (e32 > e64 + 0.1) {
+-            return tq_mm8_launch<type, 1, 4, 2, 4, 4, 3, 1, false>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream);
++            return tq_mm8_launch<type, 1, 4, 2, 4, 4, 3, 1, false, A1>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream);
+         }
+-        if (tq_mm8_launch<type, 1, 8, 4, 2, 4, 2, 1, true>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream)) {
++        if (tq_mm8_launch<type, 1, 8, 4, 2, 4, 2, 1, true, A1>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream)) {
+             return true;
+         }
+-        return tq_mm8_launch<type, 1, 8, 4, 2, 4, 3, 1, false>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream);
++        return tq_mm8_launch<type, 1, 8, 4, 2, 4, 3, 1, false, A1>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream);
+     }
+     const int NI = std::min(7, (ncols + 15)/16);
+-#define TQ5_S(n) case n: return tq_mm8_launch<type, 1, n, 4, 2, 4, 4, 2, false>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream);
++#define TQ5_S(n) case n: return tq_mm8_launch<type, 1, n, 4, 2, 4, 4, 2, false, A1>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream);
+     switch (NI) {
+         TQ5_S(1) TQ5_S(2) TQ5_S(3) TQ5_S(4) TQ5_S(5) TQ5_S(6)
+-        default: return tq_mm8_launch<type, 1, 7, 4, 2, 4, 4, 2, false>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream);
++        default: return tq_mm8_launch<type, 1, 7, 4, 2, 4, 4, 2, false, A1>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream);
+     }
+ #undef TQ5_S
+ }
+@@ -2470,7 +2527,8 @@ static bool tq_mul_mat_mm2(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     const int ncols = (int) src1->ne[1];
+     const int nb = (int) (K/QK_TQD);
+ 
+-    const bool i8 = tq_mm_v2() == 2 || tq_mm_v2() == 3;   // int8 activations (value-changing variant); 3 = v5 kernel, same values as 2
++    const bool i8 = tq_mm_v2() >= 2 && tq_mm_v2() <= 4;   // int8 activations (value-changing variant); 3 = v5 kernel, same values as 2
++    const bool a128 = tq_mm_v2() == 4;                     // P3: one activation scale per 128 (v5 kernel, int32 sums per block)
+     if (!i8 && src0->type == GGML_TYPE_TQ9_128 && nrows >= 65536 && ncols <= 32) {
+         return false;   // lm_head-size TQ9 at <= 32 columns: the v1 kernel is 3-5 % faster (round-4 op perf); caller falls back
+     }
+@@ -2483,7 +2541,12 @@ static bool tq_mul_mat_mm2(ggml_backend_cuda_context & ctx, const ggml_tensor *
+         xq.alloc((int64_t) ncols*K);
+         xs.alloc((int64_t) ncols*(K/32));
+         const dim3 grid((unsigned) ((K/32 + 7)/8), (unsigned) ncols, 1);
+-        tq_f32_to_q8_perm<<<grid, 256, 0, stream>>>((const char *) src1->data, xq.get(), xs.get(), K, src1->nb[1]);
++        if (a128) {
++            const dim3 grid128((unsigned) ((K/QK_TQD + 7)/8), (unsigned) ncols, 1);
++            tq_f32_to_q8_perm128<<<grid128, 256, 0, stream>>>((const char *) src1->data, xq.get(), xs.get(), K, src1->nb[1]);
++        } else {
++            tq_f32_to_q8_perm<<<grid, 256, 0, stream>>>((const char *) src1->data, xq.get(), xs.get(), K, src1->nb[1]);
++        }
+     } else {
+         xp.alloc((int64_t) ncols*K);
+         const dim3 grid((unsigned) std::min<int64_t>((K + 255)/256, 16), (unsigned) ncols, 1);
+@@ -2523,6 +2586,13 @@ static bool tq_mul_mat_mm2(ggml_backend_cuda_context & ctx, const ggml_tensor *
+             case GGML_TYPE_TQ81_128: done = tq_mm5_dispatch<GGML_TYPE_TQ81_128>(W0, xq.get(), xs.get(), out, K, nrows, src0->nb[1], ncols, sy_col, S, nbs, stream); break;
+             default: return false;
+         }
++    } else if (a128) {   // P3: same K chunks and reduction as v5; if v5 cannot run, v4 int8 runs on the same per-128 scales
++        switch (src0->type) {
++            case GGML_TYPE_TQ9_128:  done = tq_mm5_dispatch<GGML_TYPE_TQ9_128,  true>(W0, xq.get(), xs.get(), out, K, nrows, src0->nb[1], ncols, sy_col, S, nbs, stream); break;
++            case GGML_TYPE_TQ27_128: done = tq_mm5_dispatch<GGML_TYPE_TQ27_128, true>(W0, xq.get(), xs.get(), out, K, nrows, src0->nb[1], ncols, sy_col, S, nbs, stream); break;
++            case GGML_TYPE_TQ81_128: done = tq_mm5_dispatch<GGML_TYPE_TQ81_128, true>(W0, xq.get(), xs.get(), out, K, nrows, src0->nb[1], ncols, sy_col, S, nbs, stream); break;
++            default: return false;
++        }
+     }
+     if (done) {
+         // v5 ran
+-- 
+2.43.0
+

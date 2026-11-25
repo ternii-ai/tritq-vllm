@@ -1,0 +1,35 @@
+From 195794f4654d6ae88e4d9613699134088cfc5a4b Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:24:12 +0000
+Subject: [PATCH] ggml-cuda: one activation scale per 128 is the default
+ mat-mat (GGML_CUDA_TQ_MM_V2=4)
+
+GGML_CUDA_TQ_MM_V2 now defaults to 4 (0015: int8 activations with one
+absmax scale per 128-value block, v5 kernel) instead of 1 (0012: f16
+activations). This changes outputs of the dense (non-MoE) mat-mat of the
+dense trit types, used from 8 columns on (prompts and long verify passes).
+Single-token decode, 2-7 column mat-vec and MUL_MAT_ID are not affected.
+GGML_CUDA_TQ_MM_V2=1 gives the previous default (r5) back; =0, =2 and =3
+work as before.
+---
+ ggml/src/ggml-cuda/tq.cu | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/tq.cu b/ggml/src/ggml-cuda/tq.cu
+index 3a7990849..2b54a3f9e 100644
+--- a/ggml/src/ggml-cuda/tq.cu
++++ b/ggml/src/ggml-cuda/tq.cu
+@@ -1627,8 +1627,8 @@ static int tq_mm2_as() {
+ }
+ 
+ static int tq_mm_v2() {
+-    static int v = tq_env("GGML_CUDA_TQ_MM_V2", 1);   // default on (v4, r5): =1 f16 mat-mat v4, =0 v3 mat-mat (r4), =2 int8 variant (not gated), =3 int8 v5 (same values as 2),
+-                                                       // =4 int8 v5 with one activation scale per 128 (P3, value-changing vs 2/3)
++    static int v = tq_env("GGML_CUDA_TQ_MM_V2", 4);   // default 4 (r6): int8 v5 with one activation scale per 128 (P3, value-changing vs 1/2/3);
++                                                       // =1 f16 mat-mat v4 (r5 default), =0 v3 mat-mat (r4), =2 int8 variant, =3 int8 v5 (same values as 2)
+     return v;
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

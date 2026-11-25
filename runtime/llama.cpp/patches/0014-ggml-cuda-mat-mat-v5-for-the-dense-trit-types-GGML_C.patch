@@ -1,0 +1,611 @@
+From e20895f956ae23cf348f3065c8d61a5948064f21 Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 17:06:57 +0000
+Subject: [PATCH] ggml-cuda: mat-mat v5 for the dense trit types
+ (GGML_CUDA_TQ_MM_V2=3, opt-in)
+
+GGML_CUDA_TQ_MM_V2=3: a third tensor-core mat-mat kernel for dense (non-MoE)
+layers of the dense trit types. Output is bit-identical to the int8 variant
+GGML_CUDA_TQ_MM_V2=2 (same activation quantisation, same per-k32 float
+epilogue in the same block order, same K split and reduction). The default
+(GGML_CUDA_TQ_MM_V2=1, f16) is unchanged.
+
+- Persistent CTAs walk (tile, k-block) steps; the raw trit bytes stream in
+  with 16-byte cp.async across tile boundaries.
+- Producer warps decode each weight once per 64 x BN tile into shared memory;
+  consumer warps run ldmatrix + int8 mma.sync on it while the next block is
+  decoded (named barriers between the two).
+- From 113 columns: 64 x 128 tiles, finished tiles staged in shared memory and
+  written out by the producer warps during the next tile.
+  32 x 128 tiles instead when that fills the last round of CTAs better.
+---
+ ggml/src/ggml-cuda/tq.cu | 545 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 542 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/tq.cu b/ggml/src/ggml-cuda/tq.cu
+index 9b8fbb50a..9af9045ad 100644
+--- a/ggml/src/ggml-cuda/tq.cu
++++ b/ggml/src/ggml-cuda/tq.cu
+@@ -1384,7 +1384,7 @@ static int tq_mm2_as() {
+ }
+ 
+ static int tq_mm_v2() {
+-    static int v = tq_env("GGML_CUDA_TQ_MM_V2", 1);   // default on (v4, r5): =1 f16 mat-mat v4, =0 v3 mat-mat (r4), =2 int8 variant (not gated)
++    static int v = tq_env("GGML_CUDA_TQ_MM_V2", 1);   // default on (v4, r5): =1 f16 mat-mat v4, =0 v3 mat-mat (r4), =2 int8 variant (not gated), =3 int8 v5 (same values as 2)
+     return v;
+ }
+ 
+@@ -1504,6 +1504,36 @@ static __device__ __forceinline__ void tq_mm3_decode_row(const uint32_t w[7], co
+     }
+ }
+ 
++// (v5) tq_mm3_decode_row with cheaper packing, same bytes: per byte u - L + 128 lies in [0, 255] (L <= 40), so one
++// 32-bit add of (128 - L) x 0x01010101 never carries between bytes; XOR 0x80 per byte then gives the int8 u - L.
++template <int N, int W>
++static __device__ __forceinline__ void tq_mm5_decode_row_s8(const uint32_t w[7], const int t, uint32_t pr[8]) {
++    constexpr uint32_t P1 = tq_pow<N, 1>::v, P2 = tq_pow<N, 2>::v, P3 = tq_pow<N, 3>::v, P4 = tq_pow<N, 4>::v;
++    constexpr uint32_t BIAS = (uint32_t) (128 - (N - 1)/2) * 0x01010101u;
++    static_assert((N - 1)/2 <= 127 && N - 1 + 128 - (N - 1)/2 <= 255, "byte range");
++    uint32_t u[32];
++#pragma unroll
++    for (int c = 0; c < 6; ++c) {
++        const uint32_t X = W == 32 ? w[c] : w[c] << (32 - W);
++        u[5*c + 0] = __umulhi(X,    (uint32_t) N);
++        u[5*c + 1] = __umulhi(X*P1, (uint32_t) N);
++        u[5*c + 2] = __umulhi(X*P2, (uint32_t) N);
++        u[5*c + 3] = __umulhi(X*P3, (uint32_t) N);
++        u[5*c + 4] = __umulhi(X*P4, (uint32_t) N);
++    }
++    {
++        const uint32_t X  = W == 32 ? w[6] : w[6] << (32 - W);
++        const uint32_t Xs = (t & 1) ? X*P2 : X;
++        u[30] = __umulhi(Xs,    (uint32_t) N);
++        u[31] = __umulhi(Xs*P1, (uint32_t) N);
++    }
++#pragma unroll
++    for (int m = 0; m < 8; ++m) {
++        const uint32_t x = __byte_perm(__byte_perm(u[4*m], u[4*m + 1], 0x0040), __byte_perm(u[4*m + 2], u[4*m + 3], 0x0040), 0x5410);
++        pr[m] = (x + BIAS) ^ 0x80808080u;
++    }
++}
++
+ #define TQ_MM3_KS 144   // smem row stride in bytes (128 + 16: ldmatrix rows conflict-free)
+ 
+ template <ggml_type type, int NT, int WM, bool AS>
+@@ -1692,6 +1722,504 @@ static void tq_mm3_dispatch(int WM, int NT, const char * W0, const int8_t * Xq,
+     }
+ }
+ 
++// ---------------------------------------------------------------------------------------------------------------------
++// (K1 P1+P2, GGML_CUDA_TQ_MM_V2=3) mat-mat v5 for the int8 variant: same values as tq_mm3_kernel (v4 int8), bit for bit.
++//  - Persistent CTAs walk a flat list of (item, k-block) steps; an item = one BM x BN output tile of one K chunk (the same
++//    K chunks as v4's split-K, reduced by the same tq_mm2_reduce, so every output sees v4's exact float sequence).
++//  - Raw trit bytes are streamed with 16-B cp.async, D steps ahead, across item boundaries (the stream never stops at a
++//    tile edge); int8 activations + their per-32 scales E steps ahead. One __syncthreads per step.
++//  - P2: each weight is decoded ONCE per CTA tile into shared memory as int8 (same permuted k order as v4), double
++//    buffered, while the tensor cores work on the previous block. Warps then split rows x columns and read A and B
++//    fragments with ldmatrix (XOR-swizzled 16-B chunks, conflict-free).
++//  - Per output and per k-block the epilogue is v4's expression in v4's order:
++//      acc = fmaf(d, fmaf(sa, (float) c0, sb*(float) c1), acc)   for the k32 pairs (0,1) then (2,3).
++//    Integer MMA sums are exact, so the tiling does not change any value.
++
++template <ggml_type type> struct tq5_raw {
++    static constexpr int BS  = (int) sizeof(typename tq_traits<type>::block);
++    static constexpr int NCH = (BS + 15 + 15)/16;   // 16-B chunks covering one block at any even start offset
++    static constexpr int RS  = 16*NCH;              // raw row stride in smem (bytes)
++};
++
++static __device__ __forceinline__ void tq5_cp16n(void * smem, const void * gmem, const int n) {   // n <= 16 bytes, rest zero-filled
++#ifdef AMPERE_MMA_AVAILABLE
++    const unsigned int sa = (unsigned int) __cvta_generic_to_shared(smem);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(sa), "l"(gmem), "r"(n));
++#else
++    GGML_UNUSED_VARS(smem, gmem, n);
++#endif
++}
++
++struct tq5_cur {   // step cursor: item w (global work index), block i within its K chunk
++    int w, i, L, z, row0, col0;
++};
++
++static __device__ __forceinline__ void tq5_cur_set(tq5_cur & c, const int w, const int nwork, const int nrt, const int nct,
++                                                   const int nb, const int nbs) {
++    c.w = w;
++    c.i = 0;
++    if (w < nwork) {
++        const int ct = w % nct, rest = w / nct, rt = rest % nrt;
++        c.z = rest / nrt;
++        c.L = min(nb, (c.z + 1)*nbs) - c.z*nbs;
++        c.row0 = rt;
++        c.col0 = ct;
++    } else {
++        c.L = 0; c.z = 0; c.row0 = 0; c.col0 = 0;
++    }
++}
++
++static __device__ __forceinline__ void tq5_cur_next(tq5_cur & c, const int nwork, const int nrt, const int nct,
++                                                    const int nb, const int nbs) {
++    if (++c.i >= c.L) {
++        tq5_cur_set(c, c.w + gridDim.x, nwork, nrt, nct, nb, nbs);
++    }
++}
++
++// swizzled byte offset of 16-B chunk ch of row r in a [rows][128 B] tile
++static __device__ __forceinline__ int tq5_sw(const int r, const int ch) {
++    return r*128 + ((ch ^ (r & 7)) << 4);
++}
++
++
++static int tq_mm5_grid_env() {
++    static int v = tq_env("GGML_CUDA_TQ_MM5_GRID", 0);   // 0 = all SMs x occupancy
++    return v;
++}
++
++static __device__ __forceinline__ void tq7_bar_sync(const int id, const int n) {
++    asm volatile("bar.sync %0, %1;\n" :: "r"(id), "r"(n) : "memory");
++}
++static __device__ __forceinline__ void tq7_bar_arrive(const int id, const int n) {
++    asm volatile("bar.arrive %0, %1;\n" :: "r"(id), "r"(n) : "memory");
++}
++template <int n>
++static __device__ __forceinline__ void tq7_wait() {
++    asm volatile("cp.async.wait_group %0;\n" :: "n"(n) : "memory");
++}
++
++#define TQ7_BAR_FULL  1   // + buffer (0/1)
++#define TQ7_BAR_EMPTY 3   // + buffer (0/1)
++#define TQ7_BAR_PROD  5
++
++// v5 kernel: PW producer warps stream the raw trit bytes (16-B cp.async, DR stages, across item boundaries) and
++// decode each weight ONCE per tile into a double-buffered int8 A tile in shared memory; CW consumer warps stage the
++// activations (cp.async, E ahead), read A and B with ldmatrix and run IMMA + v4's exact epilogue. Producers and
++// consumers hand the A buffers over with named barriers (FULL/EMPTY per buffer). Optional staged output (SO). With SO the consumers write a
++// finished tile into a swizzled smem staging tile and go on; the producer warps drain it to global memory with 16-B
++// stores spread over the next item's steps, so the output writes overlap the tensor work instead of stalling it.
++template <ggml_type type, int MI, int NI, int CWM, int CWN, int PW, int DR, int E, bool SO>
++struct tq8_cfg {
++    static constexpr int CW = CWM*CWN;
++    static constexpr int BM = 16*MI*CWM, BN = 8*NI*CWN, NTHR = 32*(CW + PW), NCT = 32*CW, NPT = 32*PW;
++    static constexpr int RS = tq5_raw<type>::RS;
++    static constexpr int RAW_B = DR*BM*RS;
++    static constexpr int DA_B  = 2*BM*128;
++    static constexpr int DSC_B = 2*BM*4;
++    static constexpr int ACT_B = (E + 1)*BN*128;
++    static constexpr int ASC_B = (E + 1)*BN*16;
++    static constexpr int OST_B = SO ? BN*BM*4 : 0;
++    static constexpr int META_B = SO ? 16 : 0;
++    static constexpr int SMEM  = RAW_B + DA_B + DSC_B + ACT_B + ASC_B + OST_B + META_B;
++    static_assert(DR >= 2 && E >= 1, "pipeline depths");
++    static_assert(!SO || BM >= 64, "staging swizzle needs BM >= 64");
++};
++
++#define TQ8_BAR_OFULL  6
++#define TQ8_BAR_OEMPTY 7
++
++// staging tile [BN columns][BM rows] f32, row index XOR-swizzled by (4*col) mod BM: consumer writes conflict-free,
++// 4 consecutive rows stay contiguous (16-B loads for the drain)
++template <int BM>
++static __device__ __forceinline__ int tq8_ost(const int c, const int r) {
++    return c*BM + (r ^ ((4*c) & (BM - 1)));
++}
++
++template <ggml_type type, int MI, int NI, int CWM, int CWN, int PW, int DR, int E, bool SO>
++static __global__ void __launch_bounds__(32*(CWM*CWN + PW), 1)
++tq_mm8_kernel(const char * __restrict__ W0, const int8_t * __restrict__ Xq, const float * __restrict__ Xs, float * __restrict__ Y,
++              const int64_t K, const int64_t nrows, const int64_t nb01, const int ncols, const int64_t sy_col,
++              const int nbs, const int nrt, const int nct, const int nwork) {
++#ifdef AMPERE_MMA_AVAILABLE
++    typedef tq_traits<type> tr;
++    typedef typename tr::block block;
++    typedef tq8_cfg<type, MI, NI, CWM, CWN, PW, DR, E, SO> cfg;
++    constexpr int N = tr::N, W = tr::W;
++    constexpr int BM = cfg::BM, BN = cfg::BN, NTHR = cfg::NTHR, RS = cfg::RS, NCH = tq5_raw<type>::NCH;
++    constexpr int BS = tq5_raw<type>::BS;
++
++    extern __shared__ __align__(16) char tq8_sm[];
++    char   * const RAW = tq8_sm;
++    int8_t * const DA  = (int8_t *) (RAW + cfg::RAW_B);
++    float  * const DSC = (float *) ((char *) DA + cfg::DA_B);
++    int8_t * const ACT = (int8_t *) ((char *) DSC + cfg::DSC_B);
++    float  * const ASC = (float *) ((char *) ACT + cfg::ACT_B);
++    float  * const OST = (float *) ((char *) ASC + cfg::ASC_B);
++    int    * const META = (int *) ((char *) OST + cfg::OST_B);
++
++    const int tid = threadIdx.x, warp = tid / WARP_SIZE, lane = tid % WARP_SIZE;
++    const int nb = (int) (K/QK_TQD);
++    const int64_t ng = K/32;
++    const bool split = nbs < nb;   // v4's split-K: partials [z][col][row], reduced by tq_mm2_reduce
++
++    int T = 0, NIT = 0;
++    for (int w = blockIdx.x; w < nwork; w += gridDim.x) {
++        const int z = w / (nrt*nct);
++        T += min(nb, (z + 1)*nbs) - z*nbs;
++        ++NIT;
++    }
++
++    if (warp >= cfg::CW) {
++        // ------------------------------------------------ producers ------------------------------------------------
++        const int pt = tid - cfg::NCT;
++        tq5_cur cr, cd, ce;   // raw issue, decode, item-end tracking (step s - 2)
++        tq5_cur_set(cr, blockIdx.x, nwork, nrt, nct, nb, nbs);
++        cd = cr; ce = cr;
++        auto issue_raw = [&](const int s) {
++            if (s < T) {
++                char * dst = RAW + (s % DR)*BM*RS;
++                const int64_t rb = (int64_t) cr.row0*BM;
++                const int kb = cr.z*nbs + cr.i;
++#pragma unroll
++                for (int idx = pt; idx < BM*NCH; idx += cfg::NPT) {
++                    const int r = idx / NCH, q = idx - r*NCH;
++                    const char * addr = W0 + min(rb + r, nrows - 1)*nb01 + (int64_t) kb*BS;
++                    const char * base = (const char *) ((uintptr_t) addr & ~(uintptr_t) 15) + 16*q;
++                    const int rem = (int) (addr + BS - base);
++                    if (rem > 0) {   // never reads past the end of the block (bytes before it belong to the same tensor)
++                        tq5_cp16n(dst + r*RS + 16*q, base, rem < 16 ? rem : 16);
++                    }
++                }
++                tq5_cur_next(cr, nwork, nrt, nct, nb, nbs);
++            }
++            tq_cp_async_commit();
++        };
++        // staged-output drain state
++        int dr_left = 0, dr_pos = 0, dr_per = 0, dr_items = 0;
++        int64_t o_r0 = 0; int o_c0 = 0, o_z = 0;
++        auto drain = [&](const int nchunks) {   // chunk = 4 rows of one column (16 B)
++            float * out = split ? Y + (int64_t) o_z*ncols*nrows : Y;
++            const int64_t cs = split ? nrows : sy_col;
++            const bool vec = (cs & 3) == 0 && ((uintptr_t) out & 15) == 0;
++            const int end = min(dr_pos + nchunks, BN*BM/4);
++            for (int ch = dr_pos + pt; ch < end; ch += cfg::NPT) {
++                const int c = ch / (BM/4), r = 4*(ch - c*(BM/4));
++                const int64_t gr = o_r0 + r;
++                const int gc = o_c0 + c;
++                if (gc >= ncols || gr >= nrows) {
++                    continue;
++                }
++                const float4 v = *(const float4 *) (OST + tq8_ost<BM>(c, r));
++                float * p = out + (int64_t) gc*cs + gr;
++                if (vec && gr + 3 < nrows) {
++                    *(float4 *) p = v;
++                } else {
++                    p[0] = v.x;
++                    if (gr + 1 < nrows) p[1] = v.y;
++                    if (gr + 2 < nrows) p[2] = v.z;
++                    if (gr + 3 < nrows) p[3] = v.w;
++                }
++            }
++            dr_pos = end;
++            if (dr_pos >= BN*BM/4) {
++                dr_left = 0;
++                ++dr_items;
++                if (dr_items < NIT) {
++                    tq7_bar_arrive(TQ8_BAR_OEMPTY, NTHR);   // the consumers may write the next tile
++                }
++            }
++        };
++        // at producer step s: consumers have finished step s - 2 (EMPTY passed); if that step ended an item, take its tile
++        auto take_tile = [&]() {
++            if constexpr (SO) {
++                const bool end = ce.i + 1 == ce.L;
++                tq5_cur_next(ce, nwork, nrt, nct, nb, nbs);
++                if (end) {
++                    tq7_bar_sync(TQ8_BAR_OFULL, NTHR);
++                    o_r0 = (int64_t) META[0]*BM; o_c0 = META[1]*BN; o_z = META[2];
++                    dr_left = 1; dr_pos = 0;
++                    const int L = ce.L > 0 ? ce.L : 1;   // spread over the next item's steps (finish 2 steps early)
++                    const int spread = max(1, L - 2);
++                    dr_per = (BN*BM/4 + spread - 1)/spread;
++                }
++            }
++        };
++#pragma unroll 1
++        for (int s = 0; s < DR - 1; ++s) {
++            issue_raw(s);
++        }
++#pragma unroll 1
++        for (int s = 0; s < T; ++s) {
++            if (s >= 2) {
++                tq7_bar_sync(TQ7_BAR_EMPTY + (s & 1), NTHR);   // consumers are done with step s - 2's buffers
++                take_tile();
++            }
++            tq7_wait<DR - 2>();                                 // own copies of raw(s) landed
++            tq7_bar_sync(TQ7_BAR_PROD, cfg::NPT);               // everyone's landed; everyone done decoding s - 1
++            issue_raw(s + DR - 1);
++            const char * src = RAW + (s % DR)*BM*RS;
++            int8_t * dst = DA + (s & 1)*BM*128;
++            float  * dsc = DSC + (s & 1)*BM;
++            const int64_t rb = (int64_t) cd.row0*BM;
++            const int kb = cd.z*nbs + cd.i;
++#pragma unroll
++            for (int u = pt; u < BM*4; u += cfg::NPT) {
++                const int r = u >> 2, tt = u & 3;
++                const uint32_t off = ((uint32_t) min(rb + r, nrows - 1)*(uint32_t) nb01 + (uint32_t) kb*BS) & 15;   // W0 is 16-aligned
++                const block & bk = *(const block *) (src + r*RS + off);
++                uint32_t w[7];
++                half dh;
++                tq_mm2_load_row<type>(bk, tt, w, dh);
++                uint32_t pr[8];
++                tq_mm5_decode_row_s8<N, W>(w, tt, pr);
++#pragma unroll
++                for (int m = 0; m < 8; ++m) {
++                    *(uint32_t *) (dst + tq5_sw(r, m) + 4*tt) = pr[m];
++                }
++                if (tt == 0) {
++                    dsc[r] = __half2float(dh);
++                }
++            }
++            tq5_cur_next(cd, nwork, nrt, nct, nb, nbs);
++            tq7_bar_arrive(TQ7_BAR_FULL + (s & 1), NTHR);
++            if (SO && dr_left) {
++                drain(dr_per);
++            }
++        }
++#pragma unroll 1
++        for (int s = T; s < T + 2; ++s) {   // match the consumers' last two EMPTY arrivals; take + drain the last tiles
++            if (s >= 2) {
++                tq7_bar_sync(TQ7_BAR_EMPTY + (s & 1), NTHR);
++                if (SO && dr_left) {
++                    drain(BN*BM/4);
++                }
++                take_tile();
++                if (SO && dr_left) {
++                    drain(BN*BM/4);
++                }
++            }
++        }
++        tq7_wait<0>();
++        return;
++    }
++
++    // -------------------------------------------------- consumers --------------------------------------------------
++    const int g = lane >> 2, t = lane & 3;
++    tq5_cur ca, cc;   // activation issue, compute/store
++    tq5_cur_set(ca, blockIdx.x, nwork, nrt, nct, nb, nbs);
++    cc = ca;
++    auto issue_act = [&](const int s) {
++        if (s < T) {
++            const int slot = s % (E + 1);
++            int8_t * dst = ACT + slot*BN*128;
++            float  * dsc = ASC + slot*BN*4;
++            const int c0 = ca.col0*BN, kb = ca.z*nbs + ca.i;
++#pragma unroll
++            for (int idx = tid; idx < BN*8; idx += cfg::NCT) {
++                const int c = idx >> 3, p = idx & 7;
++                const bool v = c0 + c < ncols;
++                tq_cp_async16(dst + tq5_sw(c, p), Xq + (int64_t) (v ? c0 + c : 0)*K + (int64_t) kb*QK_TQD + p*16, v);
++            }
++#pragma unroll
++            for (int c = tid; c < BN; c += cfg::NCT) {
++                const bool v = c0 + c < ncols;
++                tq_cp_async16(dsc + 4*c, Xs + (int64_t) (v ? c0 + c : 0)*ng + (int64_t) kb*4, v);
++            }
++            tq5_cur_next(ca, nwork, nrt, nct, nb, nbs);
++        }
++        tq_cp_async_commit();
++    };
++#pragma unroll 1
++    for (int s = 0; s < E; ++s) {
++        issue_act(s);
++    }
++
++    const int wm = warp % CWM, wn = warp / CWM;
++    const int rw = wm*16*MI, cw = wn*8*NI;
++    const int lm = lane >> 3, lr = lane & 7;
++
++    float acc[MI][NI][4];
++#pragma unroll
++    for (int mi = 0; mi < MI; ++mi) {
++#pragma unroll
++        for (int ni = 0; ni < NI; ++ni) {
++            acc[mi][ni][0] = acc[mi][ni][1] = acc[mi][ni][2] = acc[mi][ni][3] = 0.0f;
++        }
++    }
++
++    int items_done = 0;
++#pragma unroll 1
++    for (int s = 0; s < T; ++s) {
++        tq7_wait<E - 1>();                                  // own copies of act(s) landed
++        tq7_bar_sync(TQ7_BAR_FULL + (s & 1), NTHR);         // A(s) decoded; all consumers' act(s) landed; all done with s - 1
++        issue_act(s + E);
++        const int8_t * As = DA + (s & 1)*BM*128;
++        const float  * Ds = DSC + (s & 1)*BM;
++        const int8_t * Bs = ACT + (s % (E + 1))*BN*128;
++        const float  * Ss = ASC + (s % (E + 1))*BN*4;
++
++        uint32_t af[MI][4][4];
++        float dlo[MI], dhi[MI];
++#pragma unroll
++        for (int mi = 0; mi < MI; ++mi) {
++#pragma unroll
++            for (int ks = 0; ks < 4; ++ks) {
++                const int r = rw + mi*16 + (lm & 1)*8 + lr;
++                tq_ldmatrix_x4(af[mi][ks], (const half *) (As + tq5_sw(r, 2*ks + (lm >> 1))));
++            }
++            dlo[mi] = Ds[rw + mi*16 + g];
++            dhi[mi] = Ds[rw + mi*16 + g + 8];
++        }
++#pragma unroll
++        for (int ni = 0; ni < NI; ++ni) {
++            const int cc0 = cw + ni*8 + 2*t;
++            const float4 s0 = *(const float4 *) (Ss + 4*cc0);
++            const float4 s1 = *(const float4 *) (Ss + 4*(cc0 + 1));
++#pragma unroll
++            for (int kp = 0; kp < 4; kp += 2) {
++                uint32_t bb[4];
++                tq_ldmatrix_x4(bb, (const half *) (Bs + tq5_sw(cw + ni*8 + lr, 2*kp + lm)));
++                const float sa0 = kp ? s0.z : s0.x, sb0 = kp ? s0.w : s0.y;
++                const float sa1 = kp ? s1.z : s1.x, sb1 = kp ? s1.w : s1.y;
++#pragma unroll
++                for (int mi = 0; mi < MI; ++mi) {
++                    int c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
++                    tq_mma_s8(c0, af[mi][kp],     bb[0], bb[1]);
++                    tq_mma_s8(c1, af[mi][kp + 1], bb[2], bb[3]);
++                    acc[mi][ni][0] = fmaf(dlo[mi], fmaf(sa0, (float) c0[0], sb0*(float) c1[0]), acc[mi][ni][0]);
++                    acc[mi][ni][1] = fmaf(dlo[mi], fmaf(sa1, (float) c0[1], sb1*(float) c1[1]), acc[mi][ni][1]);
++                    acc[mi][ni][2] = fmaf(dhi[mi], fmaf(sa0, (float) c0[2], sb0*(float) c1[2]), acc[mi][ni][2]);
++                    acc[mi][ni][3] = fmaf(dhi[mi], fmaf(sa1, (float) c0[3], sb1*(float) c1[3]), acc[mi][ni][3]);
++                }
++            }
++        }
++
++        if constexpr (!SO) {
++            tq7_bar_arrive(TQ7_BAR_EMPTY + (s & 1), NTHR);  // done with A(s); direct stores below must not hold the producers
++        }
++        if (cc.i + 1 == cc.L) {   // last block of this item
++            if constexpr (SO) {
++                if (items_done > 0) {
++                    tq7_bar_sync(TQ8_BAR_OEMPTY, NTHR);   // the producers have drained the previous tile
++                }
++#pragma unroll
++                for (int mi = 0; mi < MI; ++mi) {
++                    const int r0 = rw + mi*16 + g, r1 = r0 + 8;
++#pragma unroll
++                    for (int ni = 0; ni < NI; ++ni) {
++                        const int c0 = cw + ni*8 + 2*t, c1 = c0 + 1;
++                        OST[tq8_ost<BM>(c0, r0)] = acc[mi][ni][0];
++                        OST[tq8_ost<BM>(c1, r0)] = acc[mi][ni][1];
++                        OST[tq8_ost<BM>(c0, r1)] = acc[mi][ni][2];
++                        OST[tq8_ost<BM>(c1, r1)] = acc[mi][ni][3];
++                        acc[mi][ni][0] = acc[mi][ni][1] = acc[mi][ni][2] = acc[mi][ni][3] = 0.0f;
++                    }
++                }
++                if (tid == 0) {
++                    META[0] = cc.row0; META[1] = cc.col0; META[2] = cc.z;
++                }
++                tq7_bar_arrive(TQ8_BAR_OFULL, NTHR);
++            } else {   // direct stores, as v4 (partials when split)
++                float * out = split ? Y + (int64_t) cc.z*ncols*nrows : Y;
++                const int64_t cs = split ? nrows : sy_col;
++                const int64_t rbase = (int64_t) cc.row0*BM + rw;
++                const int cbase = cc.col0*BN + cw;
++#pragma unroll
++                for (int mi = 0; mi < MI; ++mi) {
++                    const int64_t r0 = rbase + mi*16 + g, r1 = r0 + 8;
++#pragma unroll
++                    for (int ni = 0; ni < NI; ++ni) {
++                        const int c0 = cbase + ni*8 + 2*t, c1 = c0 + 1;
++                        if (r0 < nrows) {
++                            if (c0 < ncols) out[c0*cs + r0] = acc[mi][ni][0];
++                            if (c1 < ncols) out[c1*cs + r0] = acc[mi][ni][1];
++                        }
++                        if (r1 < nrows) {
++                            if (c0 < ncols) out[c0*cs + r1] = acc[mi][ni][2];
++                            if (c1 < ncols) out[c1*cs + r1] = acc[mi][ni][3];
++                        }
++                        acc[mi][ni][0] = acc[mi][ni][1] = acc[mi][ni][2] = acc[mi][ni][3] = 0.0f;
++                    }
++                }
++            }
++            ++items_done;
++        }
++        if constexpr (SO) {
++            tq7_bar_arrive(TQ7_BAR_EMPTY + (s & 1), NTHR);  // done with A(s) and, at an item end, its tile is staged
++        }
++        tq5_cur_next(cc, nwork, nrt, nct, nb, nbs);
++    }
++    tq7_wait<0>();
++#else
++    GGML_UNUSED_VARS(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, nbs, nrt, nct, nwork);
++    NO_DEVICE_CODE;
++#endif // AMPERE_MMA_AVAILABLE
++}
++
++template <ggml_type type, int MI, int NI, int CWM, int CWN, int PW, int DR, int E, bool SO>
++static bool tq_mm8_launch(const char * W0, const int8_t * Xq, const float * Xs, float * Y, int64_t K, int64_t nrows,
++                          int64_t nb01, int ncols, int64_t sy_col, int S, int nbs, cudaStream_t stream) {
++    typedef tq8_cfg<type, MI, NI, CWM, CWN, PW, DR, E, SO> cfg;
++    if (cfg::SMEM > 101376) {   // GB10 / sm_12x: 99 KB dynamic shared memory per block
++        return false;
++    }
++    auto kern = tq_mm8_kernel<type, MI, NI, CWM, CWN, PW, DR, E, SO>;
++    static int occ = -1;
++    if (occ < 0) {
++        CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, cfg::SMEM));
++        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern, cfg::NTHR, cfg::SMEM));
++        occ = std::max(occ, 1);
++        if (getenv("GGML_CUDA_TQ_MM5_VERBOSE")) {
++            fprintf(stderr, "tq_mm8<%d,MI=%d,NI=%d,CW=%dx%d,PW=%d,DR=%d,E=%d,SO=%d> BM=%d BN=%d smem=%d occ=%d\n", (int) type, MI, NI,
++                    CWM, CWN, PW, DR, E, (int) SO, cfg::BM, cfg::BN, cfg::SMEM, occ);
++        }
++    }
++    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
++    const int nrt = (int) ((nrows + cfg::BM - 1)/cfg::BM);
++    const int nct = (ncols + cfg::BN - 1)/cfg::BN;
++    const int nwork = nrt*nct*S;
++    int grid = tq_mm5_grid_env() > 0 ? tq_mm5_grid_env() : nsm*occ;
++    grid = std::max(1, std::min(grid, nwork));
++    kern<<<grid, cfg::NTHR, cfg::SMEM, stream>>>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, nbs, nrt, nct, nwork);
++    return true;
++}
++
++// v5 tile choice (GB10 measurements, P12 2026-11-21): 64-row tiles, 8 consumer + 4 producer warps.
++//  - ncols >= TQ5_BIG: 64 x 128 tiles, staged output (falls back to direct stores where the staging tile does not fit,
++//    e.g. TQ81's wider raw stage); 32 x 128 tiles with direct stores when that fills the last round of CTAs better.
++//  - smaller ncols: 64 x 16*NI tiles, direct stores, deeper raw/activation pipelines.
++// Returns false (caller runs v4 int8, same values) if the weights are not 16-byte aligned.
++#define TQ5_BIG 113
++template <ggml_type type>
++static bool tq_mm5_dispatch(const char * W0, const int8_t * Xq, const float * Xs, float * Y, int64_t K, int64_t nrows,
++                            int64_t nb01, int ncols, int64_t sy_col, int S, int nbs, cudaStream_t stream) {
++    if (((uintptr_t) W0 & 15) != 0 || (nb01 & 1) != 0) {
++        return false;
++    }
++    if (ncols >= TQ5_BIG) {
++        // one CTA per SM: if 64-row tiles leave the last round of tiles mostly empty, use 32-row tiles
++        const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
++        const int64_t nct = (ncols + 127)/128;
++        const int64_t w64 = (nrows + 63)/64*nct*S, w32 = (nrows + 31)/32*nct*S;
++        const double e64 = (double) w64/(double) (((w64 + nsm - 1)/nsm)*nsm);
++        const double e32 = (double) w32/(double) (((w32 + nsm - 1)/nsm)*nsm);
++        if (e32 > e64 + 0.1) {
++            return tq_mm8_launch<type, 1, 4, 2, 4, 4, 3, 1, false>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream);
++        }
++        if (tq_mm8_launch<type, 1, 8, 4, 2, 4, 2, 1, true>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream)) {
++            return true;
++        }
++        return tq_mm8_launch<type, 1, 8, 4, 2, 4, 3, 1, false>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream);
++    }
++    const int NI = std::min(7, (ncols + 15)/16);
++#define TQ5_S(n) case n: return tq_mm8_launch<type, 1, n, 4, 2, 4, 4, 2, false>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream);
++    switch (NI) {
++        TQ5_S(1) TQ5_S(2) TQ5_S(3) TQ5_S(4) TQ5_S(5) TQ5_S(6)
++        default: return tq_mm8_launch<type, 1, 7, 4, 2, 4, 4, 2, false>(W0, Xq, Xs, Y, K, nrows, nb01, ncols, sy_col, S, nbs, stream);
++    }
++#undef TQ5_S
++}
++
+ // dense only (ids == nullptr), called after ggml_cuda_tq_mm_supports passed
+ static bool tq_mul_mat_mm2(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     cudaStream_t stream = ctx.stream();
+@@ -1699,7 +2227,7 @@ static bool tq_mul_mat_mm2(ggml_backend_cuda_context & ctx, const ggml_tensor *
+     const int ncols = (int) src1->ne[1];
+     const int nb = (int) (K/QK_TQD);
+ 
+-    const bool i8 = tq_mm_v2() == 2;   // int8 activations (value-changing variant)
++    const bool i8 = tq_mm_v2() == 2 || tq_mm_v2() == 3;   // int8 activations (value-changing variant); 3 = v5 kernel, same values as 2
+     if (!i8 && src0->type == GGML_TYPE_TQ9_128 && nrows >= 65536 && ncols <= 32) {
+         return false;   // lm_head-size TQ9 at <= 32 columns: the v1 kernel is 3-5 % faster (round-4 op perf); caller falls back
+     }
+@@ -1744,7 +2272,18 @@ static bool tq_mul_mat_mm2(ggml_backend_cuda_context & ctx, const ggml_tensor *
+         part.alloc((int64_t) S*ncols*nrows);
+         out = part.get();
+     }
+-    if (i8) {
++    bool done = false;
++    if (i8 && tq_mm_v2() == 3) {   // v5: v4 int8's K chunks (S, nbs) and reduction -> bit-identical output
++        switch (src0->type) {
++            case GGML_TYPE_TQ9_128:  done = tq_mm5_dispatch<GGML_TYPE_TQ9_128> (W0, xq.get(), xs.get(), out, K, nrows, src0->nb[1], ncols, sy_col, S, nbs, stream); break;
++            case GGML_TYPE_TQ27_128: done = tq_mm5_dispatch<GGML_TYPE_TQ27_128>(W0, xq.get(), xs.get(), out, K, nrows, src0->nb[1], ncols, sy_col, S, nbs, stream); break;
++            case GGML_TYPE_TQ81_128: done = tq_mm5_dispatch<GGML_TYPE_TQ81_128>(W0, xq.get(), xs.get(), out, K, nrows, src0->nb[1], ncols, sy_col, S, nbs, stream); break;
++            default: return false;
++        }
++    }
++    if (done) {
++        // v5 ran
++    } else if (i8) {
+         switch (src0->type) {
+             case GGML_TYPE_TQ9_128:  tq_mm3_dispatch<GGML_TYPE_TQ9_128> (WM, NT, W0, xq.get(), xs.get(), out, K, nrows, src0->nb[1], ncols, sy_col, gy, S, nbs, stream); break;
+             case GGML_TYPE_TQ27_128: tq_mm3_dispatch<GGML_TYPE_TQ27_128>(WM, NT, W0, xq.get(), xs.get(), out, K, nrows, src0->nb[1], ncols, sy_col, gy, S, nbs, stream); break;
+-- 
+2.43.0
+

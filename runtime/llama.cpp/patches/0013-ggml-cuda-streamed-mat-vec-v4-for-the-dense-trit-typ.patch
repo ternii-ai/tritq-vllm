@@ -1,0 +1,339 @@
+From f8e1aa778c7375236daa4630186a664b63687948 Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 15:48:21 +0000
+Subject: [PATCH] ggml-cuda: streamed mat-vec v4 for the dense trit types
+ (default on)
+
+GGML_CUDA_TQ_MMV (default now 4): a persistent variant of the decode
+mat-vec for TQ9_128 / TQ27_128 / TQ81_128. Each warp walks rows (up to 16
+blocks per step), loads the next step's raw bytes with 16-byte loads
+while it decodes the current one from shared memory. The per-lane unit
+order, the FMA sequence and the warp reduction are those of the v1 kernel,
+so outputs are bit-identical to GGML_CUDA_TQ_MMV=1.
+
+v4 is used where it was measured faster on a DGX Spark: dense
+MUL_MAT with 1 column (all three types) and 2 columns (TQ27 / TQ81).
+Other cases (3-8 columns, MUL_MAT_ID, tensors whose base or size is not
+a multiple of 16 bytes) stay on v1. GGML_CUDA_TQ_MMV=1 restores v1
+everywhere; GGML_CUDA_TQ_MMV4_ALL=1 sends every mat-vec case to v4.
+---
+ ggml/src/ggml-cuda/tq.cu | 261 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 252 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/tq.cu b/ggml/src/ggml-cuda/tq.cu
+index 9b8fbb50a..af8139149 100644
+--- a/ggml/src/ggml-cuda/tq.cu
++++ b/ggml/src/ggml-cuda/tq.cu
+@@ -215,8 +215,207 @@ tq_mmv2_kernel(const char * __restrict__ W0, const float * __restrict__ X, float
+     }
+ }
+ 
+-static int tq_mmv_version() {
+-    static int v = [] { const char * e = getenv("GGML_CUDA_TQ_MMV"); return e ? atoi(e) : 1; }();
++// ---------------------------------------------------------------------------------------------------------------------
++// v4 (GGML_CUDA_TQ_MMV=4): v1's arithmetic with a streamed load pattern. Persistent warps walk "pieces" (item, segment):
++// item = (channel, row), segment = up to TQ4_SB blocks of that row. A warp stages one piece in shared memory and decodes it
++// while the next piece's bytes are in flight in registers (16-byte loads; the start is aligned down to 16 B, so rows need
++// not be 16-B aligned, only the tensor base and size). Per lane the (block, word) units, their order, the FMA sequence and
++// the warp reduction are exactly those of tq_mmv_kernel (v1), so the output is bit-identical to v1.
++#define TQ4_SB 16   // blocks per segment: 16*26 = 416 = 13*32 units, so a lane's units continue across segments unchanged
++
++template <ggml_type type> struct tq4_cfg {
++    typedef typename tq_traits<type>::block block;
++    static constexpr int BS   = (int) sizeof(block);
++    static constexpr int SEG  = TQ4_SB*BS;                 // bytes of a full segment
++    static constexpr int NQ   = (SEG + 15)/16 + 1;         // 16-B chunks incl. the align-down slack
++    static constexpr int PL   = (NQ + WARP_SIZE - 1)/WARP_SIZE;
++    static constexpr int SMEM = NQ*16;
++    static_assert(SEG % 16 == 0, "segment must keep the 16-B phase of the row");
++    static_assert((TQ4_SB*TQD_NW) % WARP_SIZE == 0, "segment units must be a multiple of the warp size");
++};
++
++#define TQ4_MAXCH 64   // MUL_MAT_ID channels (tokens x experts used) the v4 kernel takes; more -> v1
++#ifndef TQ4_MINB
++#define TQ4_MINB 8    // CTAs per SM the register budget is sized for (8: no spills at any ncols; 10-12 spill)
++#endif
++#ifndef TQ4_UNR
++#define TQ4_UNR 13    // unroll of the 13 unit steps of a full segment
++#endif
++static constexpr int tq4_unr = TQ4_UNR;
++template <ggml_type type, int ncols, bool has_ids>
++static __global__ void __launch_bounds__(TQ_MMV_ROWS_PER_CTA*WARP_SIZE, TQ4_MINB)
++tq_mmv4_kernel(const char * __restrict__ W0, const float * __restrict__ X, float * __restrict__ Y,
++               const int64_t K, const int64_t nrows, const int64_t nb01, const int64_t nb02,
++               const int64_t sx_col, const int64_t sy_col,
++               const int32_t * __restrict__ ids, const int n_used, const int64_t ne11,
++               const int64_t ids_s0, const int64_t ids_s1, const int64_t sx11, const int64_t sx12,
++               const int64_t sy1, const int64_t sy2, const int nitems, const int cs) {
++    typedef tq_traits<type> tr;
++    typedef tq4_cfg<type>   cf;
++    typedef typename tr::block block;
++    constexpr int N = tr::N, W = tr::W;
++
++    __shared__ __align__(16) char sm[TQ_MMV_ROWS_PER_CTA][cf::SMEM];
++    __shared__ int64_t eoff[has_ids ? TQ4_MAXCH : 1];   // expert*nb02 per channel (MUL_MAT_ID)
++
++    const int lane = threadIdx.x, wi = threadIdx.y;
++    const int nr   = (int) nrows;
++    if (has_ids) {
++        const int nchan = nitems/nr;
++        for (int c = wi*WARP_SIZE + lane; c < nchan; c += TQ_MMV_ROWS_PER_CTA*WARP_SIZE) {
++            eoff[c] = (int64_t) ids[(c % n_used)*ids_s0 + (c / n_used)*ids_s1]*nb02;
++        }
++        __syncthreads();
++    }
++    const int GW = gridDim.x*TQ_MMV_ROWS_PER_CTA;
++    int       i  = blockIdx.x*TQ_MMV_ROWS_PER_CTA + wi;
++    if (i >= nitems) {
++        return;
++    }
++    const int nb   = (int)(K/QK_TQD);
++    const int nseg = (nb + TQ4_SB - 1)/TQ4_SB;
++
++    // item it = c*nrows + row, c = channel (as blockIdx.y in v1): same offset expressions as v1
++    auto chan = [&](const int it) { return has_ids ? it / nr : 0; };
++    auto wrow = [&](const int it) -> const char * {
++        if (!has_ids) {
++            return W0 + (int64_t) it*nb01;
++        }
++        const int c = chan(it);
++        return W0 + eoff[c] + (int64_t) (it - c*nr)*nb01;
++    };
++
++    uint4 nx[cf::PL];
++    int   noff = 0, nnq = 0;
++    auto fetch = [&](const char * rb, const int s) {
++        const char * p  = rb + s*cf::SEG;
++        const int   len = min(TQ4_SB, nb - s*TQ4_SB)*cf::BS;
++        const uintptr_t a = (uintptr_t) p & ~(uintptr_t) 15;
++        noff = (int) ((uintptr_t) p - a);
++        nnq  = (noff + len + 15) >> 4;
++        const uint4 * q = (const uint4 *) a;
++#pragma unroll
++        for (int k = 0; k < cf::PL; ++k) {
++            const int j = lane + WARP_SIZE*k;
++            if (j < nnq) {
++                nx[k] = cs ? __ldcs(q + j) : __ldg(q + j);
++            }
++        }
++    };
++
++    fetch(wrow(i), 0);
++    int s = 0;
++
++    float acc[ncols];
++#pragma unroll
++    for (int c = 0; c < ncols; ++c) {
++        acc[c] = 0.0f;
++    }
++
++    while (true) {
++        const int off = noff, cnq = nnq;
++        __syncwarp();
++#pragma unroll
++        for (int k = 0; k < cf::PL; ++k) {
++            const int j = lane + WARP_SIZE*k;
++            if (j < cnq) {
++                ((uint4 *) sm[wi])[j] = nx[k];
++            }
++        }
++        __syncwarp();
++
++        // next piece: its bytes load while this one decodes
++        int ni = i;
++        int ns = s + 1;
++        if (ns == nseg) {
++            ns = 0;
++            ni = i + GW;
++        }
++        if (ni < nitems) {
++            fetch(wrow(ni), ns);
++        }
++
++        int64_t xo = 0;
++        if (has_ids) {
++            const int c = chan(i);
++            xo = (c % n_used % ne11)*sx11 + (c / n_used)*sx12;
++        }
++        const block * sb = (const block *) (sm[wi] + off);
++        const float * x  = X + xo;
++        // one (block, word) unit, exactly as in tq_mmv_kernel
++        auto unit = [&](const int u) {
++            const int b = u / TQD_NW;
++            const int w = u - b*TQD_NW;
++            const block & blk = sb[b - s*TQ4_SB];
++            uint32_t t = tr::word(blk, w);
++            const float d = __half2float(blk.d);
++            const float * xb = x + b*QK_TQD + w;
++
++            float part[ncols];
++#pragma unroll
++            for (int c = 0; c < ncols; ++c) {
++                part[c] = 0.0f;
++            }
++            float q[5];
++            tq_codes5<N, W>(t, q);
++#pragma unroll
++            for (int k = 0; k < 5; ++k) {
++                if (k < 4 || w < QK_TQD - 4*TQD_NW) {
++#pragma unroll
++                    for (int c = 0; c < ncols; ++c) {
++                        part[c] = fmaf(q[k], __ldg(xb + c*sx_col + k*TQD_NW), part[c]);
++                    }
++                }
++            }
++#pragma unroll
++            for (int c = 0; c < ncols; ++c) {
++                acc[c] = fmaf(d, part[c], acc[c]);
++            }
++        };
++        const int u0 = s*TQ4_SB*TQD_NW;
++        if ((s + 1)*TQ4_SB <= nb) {
++            // full segment: 13 units per lane, the lane's units in increasing order
++#pragma unroll tq4_unr
++            for (int j = 0; j < TQ4_SB*TQD_NW/WARP_SIZE; ++j) {
++                unit(u0 + lane + WARP_SIZE*j);
++            }
++        } else {
++            const int u1 = nb*TQD_NW;
++#pragma unroll 2
++            for (int u = u0 + lane; u < u1; u += WARP_SIZE) {
++                unit(u);
++            }
++        }
++
++        if (s == nseg - 1) {
++#pragma unroll
++            for (int c = 0; c < ncols; ++c) {
++                acc[c] = warp_reduce_sum(acc[c]);
++            }
++            if (lane == 0) {
++                const int     c   = chan(i);
++                const int64_t row = i - c*nr;
++                float * y = Y + (has_ids ? (c % n_used)*sy1 + (c / n_used)*sy2 : 0);
++#pragma unroll
++                for (int k = 0; k < ncols; ++k) {
++                    y[k*sy_col + row] = acc[k];
++                }
++            }
++#pragma unroll
++            for (int c = 0; c < ncols; ++c) {
++                acc[c] = 0.0f;
++            }
++        }
++        if (ni >= nitems) {
++            break;
++        }
++        i = ni;
++        s = ns;
++    }
++}
++
++static int tq_mmv_version() {   // GGML_CUDA_TQ_MMV: 4 (default) = v4 where it is faster, else v1; 1 = v1 everywhere
++    static int v = [] { const char * e = getenv("GGML_CUDA_TQ_MMV"); return e ? atoi(e) : 4; }();
+     return v;
+ }
+ static int tq_env(const char * name, int def) {
+@@ -424,19 +623,60 @@ static void tq_mma_launch(int ncols, const char * W0, const float * X, float * Y
+         ids, n_used, ne11, ids_s0, ids_s1, sx11, sx12, sy1, sy2);
+ }
+ 
++// persistent grid size for a v4 kernel: resident CTAs per SM (occupancy) x SMs, cached per kernel
++template <ggml_type type, int ncols, bool has_ids>
++static int tq_mmv4_max_ctas() {
++    static const int v = [] {
++        int occ = 0;
++        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, tq_mmv4_kernel<type, ncols, has_ids>,
++                                                                 TQ_MMV_ROWS_PER_CTA*WARP_SIZE, 0));
++        const int cap = tq_env("GGML_CUDA_TQ_MMV4_CPS", 0);   // tuning: CTAs per SM cap (0 = occupancy limit)
++        if (cap > 0 && cap < occ) occ = cap;
++        return std::max(occ, 1)*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
++    }();
++    return v;
++}
++
+ template <ggml_type type, int ncols>
+ static void tq_mmv_launch(const char * W0, const float * X, float * Y, int64_t K, int64_t nrows, int64_t nb01, int64_t nb02,
+                           int64_t sx_col, int64_t sy_col, const int32_t * ids, int n_used, int64_t ne11,
+                           int64_t ids_s0, int64_t ids_s1, int64_t sx11, int64_t sx12, int64_t sy1, int64_t sy2,
+-                          int nchan, cudaStream_t stream) {
++                          int nchan, bool v4ok, cudaStream_t stream) {
+     const dim3 block(WARP_SIZE, TQ_MMV_ROWS_PER_CTA, 1);
++    // v4: persistent streamed-load variant of v1 (bit-identical); needs a 16-B aligned tensor base and size, < 2^31 rows
++    // in total and (MUL_MAT_ID) <= TQ4_MAXCH channels, else v1
++    // By default v4 takes the dense cases where it was measured faster on a DGX Spark (GB10): 1 column (all three types)
++    // and 2 columns (TQ27 / TQ81). It is slower at >= 4 columns and on most MUL_MAT_ID shapes, which stay on v1.
++    // GGML_CUDA_TQ_MMV4_ALL=1 routes every mat-vec case to v4 (testing).
++    static const bool v4all = tq_env("GGML_CUDA_TQ_MMV4_ALL", 0) != 0;
++    const bool v4fast = ids == nullptr && (ncols == 1 || (ncols == 2 && type != GGML_TYPE_TQ9_128));
++    if (tq_mmv_version() == 4 && v4ok && (v4all || v4fast)) {
++        static const int cs = tq_env("GGML_CUDA_TQ_MMV4_CS", 1);   // 1: streaming (evict-first) weight loads, 0: __ldg
++        const int64_t nitems = nrows*nchan;
++        const int64_t need   = (nitems + TQ_MMV_ROWS_PER_CTA - 1)/TQ_MMV_ROWS_PER_CTA;
++        if (nitems >= INT_MAX) {
++            // fall through to v1
++        } else if (ids) {
++            if constexpr (ncols == 1) if (nchan <= TQ4_MAXCH) {
++                const dim3 grid((unsigned) std::min<int64_t>(need, tq_mmv4_max_ctas<type, 1, true>()), 1, 1);
++                tq_mmv4_kernel<type, 1, true><<<grid, block, 0, stream>>>(W0, X, Y, K, nrows, nb01, nb02, sx_col, sy_col,
++                    ids, n_used, ne11, ids_s0, ids_s1, sx11, sx12, sy1, sy2, nitems, cs);
++                return;
++            }
++        } else {
++            const dim3 grid((unsigned) std::min<int64_t>(need, tq_mmv4_max_ctas<type, ncols, false>()), 1, 1);
++            tq_mmv4_kernel<type, ncols, false><<<grid, block, 0, stream>>>(W0, X, Y, K, nrows, nb01, nb02, sx_col, sy_col,
++                ids, n_used, ne11, ids_s0, ids_s1, sx11, sx12, sy1, sy2, nitems, cs);
++            return;
++        }
++    }
+     // v3 (bf16 mma.sync) needs Ampere or newer; older GPUs use v1
+     if (tq_mmv_version() == 3 && ampere_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+         tq_mma_launch<type>(ncols, W0, X, Y, K, nrows, nb01, nb02, sx_col, sy_col, ids, n_used, ne11,
+             ids_s0, ids_s1, sx11, sx12, sy1, sy2, nchan, stream);
+         return;
+     }
+-    if (tq_mmv_version() == 1) {
++    if (tq_mmv_version() == 1 || tq_mmv_version() == 4) {   // v4 lands here when it does not take the shape
+         const dim3 grid((unsigned) ((nrows + TQ_MMV_ROWS_PER_CTA - 1)/TQ_MMV_ROWS_PER_CTA), (unsigned) nchan, 1);
+         const int unr = tq_env("GGML_CUDA_TQ_UNR", 2);
+         if (unr >= 8) {
+@@ -472,9 +712,9 @@ template <ggml_type type>
+ static void tq_mmv_switch_cols(int ncols, const char * W0, const float * X, float * Y, int64_t K, int64_t nrows, int64_t nb01,
+                                int64_t nb02, int64_t sx_col, int64_t sy_col, const int32_t * ids, int n_used, int64_t ne11,
+                                int64_t ids_s0, int64_t ids_s1, int64_t sx11, int64_t sx12, int64_t sy1, int64_t sy2,
+-                               int nchan, cudaStream_t stream) {
++                               int nchan, bool v4ok, cudaStream_t stream) {
+ #define TQ_CASE(n) case n: tq_mmv_launch<type, n>(W0, X, Y, K, nrows, nb01, nb02, sx_col, sy_col, ids, n_used, ne11, \
+-                       ids_s0, ids_s1, sx11, sx12, sy1, sy2, nchan, stream); break;
++                       ids_s0, ids_s1, sx11, sx12, sy1, sy2, nchan, v4ok, stream); break;
+     switch (ncols) {
+         TQ_CASE(1) TQ_CASE(2) TQ_CASE(3) TQ_CASE(4) TQ_CASE(5) TQ_CASE(6) TQ_CASE(7) TQ_CASE(8)
+         default: GGML_ABORT("tq_mmv: ncols %d", ncols);
+@@ -534,18 +774,21 @@ bool ggml_cuda_tq_mul_mat_vec(ggml_backend_cuda_context & ctx, const ggml_tensor
+         sy2    = dst->nb[2]/sizeof(float);
+     }
+ 
++    // v4 reads whole 16-B chunks from the tensor (row starts aligned down): stay inside [data, data + nbytes)
++    const bool v4ok = ((uintptr_t) src0->data % 16) == 0 && ggml_nbytes(src0) % 16 == 0;
++
+     switch (src0->type) {
+         case GGML_TYPE_TQ9_128:
+             tq_mmv_switch_cols<GGML_TYPE_TQ9_128>(ncols, W0, X, Y, K, nrows, src0->nb[1], src0->nb[2], sx_col, sy_col,
+-                ids_d, n_used, ne11, ids_s0, ids_s1, sx11, sx12, sy1, sy2, nchan, stream);
++                ids_d, n_used, ne11, ids_s0, ids_s1, sx11, sx12, sy1, sy2, nchan, v4ok, stream);
+             break;
+         case GGML_TYPE_TQ27_128:
+             tq_mmv_switch_cols<GGML_TYPE_TQ27_128>(ncols, W0, X, Y, K, nrows, src0->nb[1], src0->nb[2], sx_col, sy_col,
+-                ids_d, n_used, ne11, ids_s0, ids_s1, sx11, sx12, sy1, sy2, nchan, stream);
++                ids_d, n_used, ne11, ids_s0, ids_s1, sx11, sx12, sy1, sy2, nchan, v4ok, stream);
+             break;
+         case GGML_TYPE_TQ81_128:
+             tq_mmv_switch_cols<GGML_TYPE_TQ81_128>(ncols, W0, X, Y, K, nrows, src0->nb[1], src0->nb[2], sx_col, sy_col,
+-                ids_d, n_used, ne11, ids_s0, ids_s1, sx11, sx12, sy1, sy2, nchan, stream);
++                ids_d, n_used, ne11, ids_s0, ids_s1, sx11, sx12, sy1, sy2, nchan, v4ok, stream);
+             break;
+         default:
+             return false;
+-- 
+2.43.0
+

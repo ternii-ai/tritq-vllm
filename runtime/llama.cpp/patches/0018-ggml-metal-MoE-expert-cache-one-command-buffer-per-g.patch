@@ -1,0 +1,58 @@
+From e335d705dc408c59bc23fd00e6e38ce6d478dffc Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:00:00 +0000
+Subject: [PATCH] ggml-metal: MoE expert cache: one command buffer per graph in
+ every context
+
+The asynchronous expert cache (LLAMA_MOE_ASYNC=1) signals "done" at the
+end of each graph_compute command buffer, and the resolver thread reads
+the selected experts once it sees that value. This needs one command
+buffer per graph_compute (n_cb = 0). The first mark switched only the
+backend it was called on; the events and counters are global, so a later
+context got a new Metal backend with the default n_cb = 1. There "done"
+was signalled after the main thread's first nodes, before the rest of
+the split had run, and the resolver read the selected experts too early:
+stale or uninitialised ids. llama-bench creates one context per test, so
+its tg test after a pp test failed the assert on the expert ids
+(ids[i] >= 0 && ids[i] < n_expert) in the resolver thread.
+
+The mark now switches any backend that still has n_cb != 0 and, as for
+the first mark, waits for that backend's earlier work before the first
+"done" value is used. A single context (llama-server, llama-cli) is
+unchanged: its backend is already switched at the first mark.
+---
+ ggml/src/ggml-metal/ggml-metal-context.m | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index dec173e3e..5435e358e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -886,13 +886,18 @@ void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
+ 
+ void ggml_metal_moe_mark(ggml_metal_t ctx, uint64_t * v_done, uint64_t * v_go) {
+     if (spin_mode() == 2) { fill_start(ctx->dev); g_fill_last = mach_absolute_time(); }
+-    if (!g_moe_inbuf) {
+-        id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(ctx->dev);
+-        g_moe_done_ev = [device newSharedEvent];
+-        g_moe_go_ev   = [device newSharedEvent];
++    // the in-buffer mode needs ONE command buffer per graph_compute (n_cb = 0): with more, "done" is signalled after the main thread's
++    // first nodes, before the rest of the split (and its selected experts) has run. The events are global but n_cb is per backend, so a
++    // later context (llama-bench makes one per test) must be switched too, or the resolver reads the selected experts too early
++    if (!g_moe_inbuf || ctx->n_cb != 0) {
++        if (!g_moe_inbuf) {
++            id<MTLDevice> device = (id<MTLDevice>) ggml_metal_device_get_obj(ctx->dev);
++            g_moe_done_ev = [device newSharedEvent];
++            g_moe_go_ev   = [device newSharedEvent];
++            g_moe_inbuf = true;
++        }
+         ggml_metal_set_n_cb(ctx, 0);
+-        g_moe_inbuf = true;
+-        // nothing has signalled yet: the caller waits for the last graph_compute to complete the old way
++        // nothing of this backend has signalled yet: the caller waits for the last graph_compute to complete the old way
+         ggml_metal_synchronize(ctx);
+         *v_done = 0;
+     } else {
+-- 
+2.54.0 (Apple Git-157)
+
