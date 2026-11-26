@@ -115,7 +115,9 @@ env ${MOE[@]+"${MOE[@]}"} \
 SP=$!
 # keep the Mac and its GPU awake while the server runs (without this the GPU clocks down and decode is much slower)
 caffeinate -ims -w $SP &
-trap 'kill $SP 2>/dev/null; wait $SP 2>/dev/null; echo; say "Stopped."; exit 0' INT TERM
+trap 'kill $SP 2>/dev/null; wait $SP 2>/dev/null; echo; say "Stopped."; exit 0' TERM
+# Ctrl-C already reaches the server (same process group); a second signal makes it abort mid-cleanup, so signal it only if it is still running after 20 s
+trap 'for i in $(seq 40); do kill -0 $SP 2>/dev/null || break; sleep 0.5; done; kill -0 $SP 2>/dev/null && kill $SP 2>/dev/null || true; wait $SP 2>/dev/null || true; echo; say "Stopped."; exit 0' INT
 until curl -s -m 2 "http://127.0.0.1:$PORT/health" | grep -q '"ok"'; do
   kill -0 $SP 2>/dev/null || { tail -20 "$DIR/server.log"; die "the server stopped while loading (log: $DIR/server.log)."; }
   sleep 2
