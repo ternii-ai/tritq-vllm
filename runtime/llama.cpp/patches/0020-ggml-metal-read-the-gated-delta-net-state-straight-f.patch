@@ -1,0 +1,248 @@
+From 30bb38749dd3a1b2ced974142c9df9b010c8941a Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:02 +0000
+Subject: [PATCH 20/22] ggml-metal: read the gated-delta-net state straight
+ from the cache
+
+In a one-token, one-sequence decode graph, build_rs copies each
+gated-delta-net layer's 2 MiB recurrent state out of the cache with a
+GET_ROWS before the GDN kernel reads it. That GET_ROWS is now skipped:
+the GDN kernel reads the cache row at the id the GET_ROWS would have
+used (the id is read on the GPU). Each kernel thread reads and later
+writes only its own state elements, so updating the same row in place
+(the GDN + cache CPY fusion) stays safe. The ids are kept alive up to
+the GDN node with add_alloc_dep in every graph with this pattern, and
+the GDN dispatch always starts after a barrier because the range
+tracker does not see the cache read. Output is bit-identical.
+GGML_METAL_OPT_RSREAD=0 turns it off.
+---
+ ggml/src/ggml-metal/ggml-metal-impl.h         |  1 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp        | 90 +++++++++++++++++--
+ ggml/src/ggml-metal/ggml-metal-ops.h          |  1 +
+ .../ggml-metal/kernels/gated_delta_net.metal  | 12 ++-
+ 4 files changed, 96 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 8571604a6..e08a35e68 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -1024,6 +1024,7 @@ typedef struct {
+     uint64_t nb2;
+     uint64_t nb3;
+     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
++    uint64_t rs_nb;  // > 0: read the state from the recurrent cache row rs_ids[seq] (row stride rs_nb bytes), not from s
+ } ggml_metal_kargs_gated_delta_net;
+ 
+ // TQ step-2: GDN input prep folded into the GDN kernel (GGML_METAL_OPT_GDNPREP)
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 07eeb478d..bb25d07e9 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -23,6 +23,8 @@ static constexpr int64_t GGML_METAL_MIN_THREADGROUPS = 128;
+ 
+ // TQ step-2: follow RESHAPE / VIEW / PERMUTE / TRANSPOSE nodes to the tensor that produced the data
+ static int s2_prep_mask();
++static ggml_tensor * s2_rs_gather(const ggml_tensor * g); // TQ: state read-through, defined with the step-2 planner
++
+ static const ggml_tensor * s2_strip_views(const ggml_tensor * t) {
+     while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE)) {
+         t = t->src[0];
+@@ -272,6 +274,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             }
+         }
+ 
++        // the state read-through reads the recurrent cache, which the range tracker does not see as a source
++        if (node->flags & GGML_METAL_S2_RSREAD) {
++            is_concurrent = false;
++        }
++
+         if (!is_concurrent) {
+             ggml_metal_op_concurrency_reset(ctx);
+         }
+@@ -2053,8 +2060,15 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+         /*.nb2  =*/ nb2,
+         /*.nb3  =*/ nb3,
+         /*.nb_out =*/ nb_out,
++        /*.rs_nb  =*/ 0,
+     };
+ 
++    // state read-through (GGML_METAL_S2_RSREAD): read the state from the cache row the elided GET_ROWS would have gathered
++    const ggml_tensor * rs_gather = (op->flags & GGML_METAL_S2_RSREAD) ? s2_rs_gather(op) : nullptr;
++    if (rs_gather) {
++        args.rs_nb = rs_gather->src[0]->nb[1];
++    }
++
+     ggml_metal_encoder_set_pipeline(enc, pipeline);
+     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                  ida++); // args
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), ida++); // q
+@@ -2062,7 +2076,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), ida++); // v
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), ida++); // gate
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
+-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
++    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rs_gather ? rs_gather->src[0] : op->src[5]), ida++); // state (or the cache)
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst (attn)
+     ggml_metal_encoder_set_buffer  (enc, bid_out,                              ida++); // state_out
+ 
+@@ -2095,6 +2109,9 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+         GGML_ASSERT(pipeline.nsg == 4 && "gdnprep: S_v = 128 only");
+     }
+ 
++    // state row ids for the read-through (any valid buffer when unused)
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(rs_gather ? rs_gather->src[1] : op->src[5]), ida++);
++
+     const int nsg = pipeline.nsg;
+ 
+     ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
+@@ -6144,6 +6161,7 @@ static bool s2_env(const char * name) { const char * e = getenv(name); return e
+ static bool s2_env_on(const char * name) { const char * e = getenv(name); return !e || atoi(e) != 0; }
+ static bool s2_opt_gdnprep() { static int v = -1; if (v < 0) v = s2_env_on("GGML_METAL_OPT_GDNPREP"); return v; }
+ static bool s2_opt_ngated()  { static int v = -1; if (v < 0) v = s2_env_on("GGML_METAL_OPT_NGATED");  return v; }
++static bool s2_opt_rsread()  { static int v = -1; if (v < 0) v = s2_env_on("GGML_METAL_OPT_RSREAD");  return v; }
+ static int  s2_prep_mask()   { static int v = -1; if (v < 0) { const char * e = getenv("GGML_METAL_S2_PREP_MASK"); v = e ? atoi(e) : 15; } return v; }   // diagnostic: bit 0 q, 1 k, 2 gate, 3 beta (default 15 = all)
+ static bool s2_debug()       { static int v = -1; if (v < 0) v = s2_env("GGML_METAL_S2_DEBUG");    return v; }
+ 
+@@ -6285,19 +6303,79 @@ static int s2_plan_ngated(ggml_cgraph * gf) {
+     return n_ok;
+ }
+ 
++// the GET_ROWS that gathers a GATED_DELTA_NET's input state from the recurrent cache (build_rs), or nullptr
++static ggml_tensor * s2_rs_gather(const ggml_tensor * g) {
++    ggml_tensor * t = g->src[5];
++    while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW)) {
++        if (t->op == GGML_OP_VIEW && t->view_offs != 0) return nullptr;
++        t = t->src[0];
++    }
++    return t && t->op == GGML_OP_GET_ROWS ? t : nullptr;
++}
++
++// every reader of t (directly or through a view of t) is `g`, a view / reshape whose own readers qualify, or empty (the
++// zero-row extra-states view of build_rs and its copy)
++static bool s2_rs_only_consumer(const ggml_tensor * t, const ggml_tensor * g) {
++    auto it = s2_consumers.find(t);
++    if (it == s2_consumers.end()) return true;
++    for (const ggml_tensor * nj : it->second) {
++        if (nj == t || nj == g || ggml_nelements(nj) == 0) continue;
++        if (nj->op == GGML_OP_RESHAPE || nj->op == GGML_OP_VIEW) {
++            if (!s2_rs_only_consumer(nj, g)) return false;
++            continue;
++        }
++        return false;
++    }
++    return true;
++}
++
++// state read-through: in a one-token, one-sequence decode graph the GET_ROWS that copies the sequence's 2 MiB state row out
++// of the recurrent cache is elided and GATED_DELTA_NET reads the row in place, at the id the GET_ROWS would have used (read on
++// the GPU). Each thread of the kernel reads and later writes only its own state elements, so the in-place update of the same
++// row (GDN + cache CPY fusion) stays safe. The ids stay alive until the GDN node in EVERY graph with this pattern (allocation
++// plans can be reused across graphs with the same node count, see s2_plan_gdnprep).
++static int s2_plan_rsread(ggml_cgraph * gf, void * user_data, void (*add_alloc_dep)(void *, struct ggml_tensor *, struct ggml_tensor *)) {
++    int n_ok = 0;
++    for (int i = 0; i < gf->n_nodes; ++i) {
++        ggml_tensor * g = gf->nodes[i];
++        if (g->op != GGML_OP_GATED_DELTA_NET || (g->flags & GGML_METAL_S2_RSREAD)) continue;
++        ggml_tensor * G = s2_rs_gather(g);
++        if (!G) continue;
++        ggml_tensor * states = G->src[0];
++        ggml_tensor * ids    = G->src[1];
++        if (!states || !ids) continue;
++        if (add_alloc_dep) add_alloc_dep(user_data, ids, g);
++        const ggml_tensor * v = g->src[2];
++        const ggml_tensor * base = states->view_src ? states->view_src : states;
++        bool ok = v->ne[2] == 1 && v->ne[3] == 1 && ggml_get_op_params_i32(g, 0) == 1 &&
++                  G->type == GGML_TYPE_F32 && states->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
++                  G->ne[1] == 1 && G->ne[2] == 1 && G->ne[3] == 1 && ggml_is_contiguous(G) &&
++                  states->nb[0] == sizeof(float) && states->ne[0] == G->ne[0] && ids->ne[0] >= 1 &&
++                  ggml_is_contiguous(g->src[5]) && ggml_nelements(g->src[5]) == G->ne[0] &&
++                  base->buffer != nullptr && ggml_backend_buffer_get_usage(base->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
++                  !(G->flags & GGML_TENSOR_FLAG_OUTPUT);
++        if (!ok) continue;
++        if (!s2_rs_only_consumer(G, g)) continue;
++        G->flags |= GGML_METAL_S2_ELIDE;
++        g->flags |= GGML_METAL_S2_RSREAD;
++        n_ok++;
++    }
++    return n_ok;
++}
++
+ void ggml_metal_s2_plan(ggml_cgraph * gf, void * user_data, void (*add_alloc_dep)(void *, struct ggml_tensor *, struct ggml_tensor *)) {
+-    GGML_UNUSED(user_data); GGML_UNUSED(add_alloc_dep);   // lifetimes come from the extra sources (all graphs), see s2_plan_gdnprep
+-    const bool gp = s2_opt_gdnprep(), ng = s2_opt_ngated();
+-    if (!gp && !ng) return;
++    // GDNPREP / NGATED keep their inputs alive with extra sources (all graphs), see s2_plan_gdnprep; RSREAD uses add_alloc_dep
++    const bool gp = s2_opt_gdnprep(), ng = s2_opt_ngated(), rr = s2_opt_rsread();
++    if (!gp && !ng && !rr) return;
+     const int64_t t0 = ggml_time_us();
+     s2_build_consumers(gf);
+     const int a = gp ? s2_plan_gdnprep(gf) : 0;
+     if (a > 0) s2_build_consumers(gf);   // GDNPREP added sources
+     const int b = ng ? s2_plan_ngated(gf)  : 0;
+-    const int n_dep = 0;
++    const int n_dep = rr ? s2_plan_rsread(gf, user_data, add_alloc_dep) : 0;
+     if (s2_debug()) {
+         static int n_print = 0;
+-        if (n_print++ < 64) fprintf(stderr, "[tq-s2] plan (n_nodes %d): gdnprep %d, ngated %d (%d), %.3f ms\n", gf->n_nodes, a, b, n_dep, (ggml_time_us() - t0)/1000.0);
++        if (n_print++ < 64) fprintf(stderr, "[tq-s2] plan (n_nodes %d): gdnprep %d, ngated %d, rsread %d, %.3f ms\n", gf->n_nodes, a, b, n_dep, (ggml_time_us() - t0)/1000.0);
+     }
+ }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index 7ffcc43b1..db0781c0b 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -12,6 +12,7 @@ typedef struct ggml_metal_op * ggml_metal_op_t;
+ #define GGML_METAL_S2_ELIDE   (1 << 24) // node absorbed by a step-2 fusion: emits nothing
+ #define GGML_METAL_S2_GDNPREP (1 << 25) // GATED_DELTA_NET with its q/k l2 norms, gate and beta folded in (GGML_METAL_OPT_GDNPREP)
+ #define GGML_METAL_S2_NGATED  (1 << 26) // final MUL of RMS_NORM(x)*w*gate(z), does all three (GGML_METAL_OPT_NGATED)
++#define GGML_METAL_S2_RSREAD  (1 << 27) // GATED_DELTA_NET reads its state straight from the recurrent cache row (GGML_METAL_OPT_RSREAD)
+ 
+ void ggml_metal_s2_plan(struct ggml_cgraph * gf, void * user_data, void (*add_alloc_dep)(void *, struct ggml_tensor *, struct ggml_tensor *));
+ int  ggml_metal_op_s2_norm_gated(ggml_metal_op_t ctx, int idx);
+diff --git a/ggml/src/ggml-metal/kernels/gated_delta_net.metal b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
+index ee3d2fb4c..51363cac7 100644
+--- a/ggml/src/ggml-metal/kernels/gated_delta_net.metal
++++ b/ggml/src/ggml-metal/kernels/gated_delta_net.metal
+@@ -16,6 +16,7 @@ kernel void kernel_gated_delta_net_impl(
+         device const char * s,
+         device       char * dst,
+         device       char * dst_fuse,
++        device const int32_t * rs_ids,
+         uint3 tgpig[[threadgroup_position_in_grid]],
+         uint3 tpitg[[thread_position_in_threadgroup]],
+         uint3   ntg[[threads_per_threadgroup]])  {
+@@ -38,7 +39,10 @@ kernel void kernel_gated_delta_net_impl(
+     // input state layout [S_v, S_v, H, n_seqs] (s0 only): per-seq stride is H*D.
+     // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
+     const uint state_in_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+-    device const float * s_ptr = (device const float *) (s) + state_in_base;
++    // rs_nb > 0: s is the recurrent cache and the gather of this sequence's state row was skipped (state read-through)
++    device const float * s_ptr = args.rs_nb > 0
++        ? (device const float *) (s + (uint64_t) rs_ids[i23]*args.rs_nb) + (i21*S_v*S_v + i20*S_v)
++        : (device const float *) (s) + state_in_base;
+ 
+     float ls[NSG];
+ 
+@@ -176,6 +180,7 @@ kernel void kernel_gated_delta_net_prep_f32_4(
+         device const float * A,
+         device const float * b_raw,
+         constant ggml_metal_kargs_gdn_prep & pargs,
++        device const int32_t * rs_ids,
+         uint3 tgpig[[threadgroup_position_in_grid]],
+         uint3 tpitg[[thread_position_in_threadgroup]],
+         uint3   ntg[[threads_per_threadgroup]])  {
+@@ -196,7 +201,10 @@ kernel void kernel_gated_delta_net_prep_f32_4(
+ 
+     // the state first, as the stock kernel
+     const uint state_in_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+-    device const float * s_ptr = (device const float *) (s) + state_in_base;
++    // rs_nb > 0: s is the recurrent cache and the gather of this sequence's state row was skipped (state read-through)
++    device const float * s_ptr = args.rs_nb > 0
++        ? (device const float *) (s + (uint64_t) rs_ids[i23]*args.rs_nb) + (i21*S_v*S_v + i20*S_v)
++        : (device const float *) (s) + state_in_base;
+ 
+     float ls[NSG];
+ 
+-- 
+2.54.0 (Apple Git-157)
+

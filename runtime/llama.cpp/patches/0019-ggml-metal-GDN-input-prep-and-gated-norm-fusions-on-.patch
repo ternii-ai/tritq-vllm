@@ -1,0 +1,45 @@
+From 30baab8ed940cbaf8360a6934e596ed52ed1c335 Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:01 +0000
+Subject: [PATCH 19/22] ggml-metal: GDN input prep and gated norm fusions on by
+ default
+
+The two decode fusions of patch 0003 (GGML_METAL_OPT_GDNPREP: the q/k
+l2 norms, gate and beta folded into the gated-delta-net kernel;
+GGML_METAL_OPT_NGATED: RMS_NORM * w * gate(z) in one dispatch) were
+opt-in. They also match the Qwen3.6-35B-A3B decode graph (30 + 30 per
+token) and its outputs are bit-identical with them on. They are now on
+by default; GGML_METAL_OPT_GDNPREP=0 / GGML_METAL_OPT_NGATED=0 turn
+them off.
+---
+ ggml/src/ggml-metal/ggml-metal-ops.cpp | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 5d37830bf..07eeb478d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -6133,15 +6133,17 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) {
+ // get GGML_METAL_S2_ELIDE (they emit nothing), the chain's LAST node does all the work and gets the activation inputs
+ // as extra sources - this keeps them alive in the allocator and makes the concurrency / barrier logic see them.
+ // A consumer check refuses a fusion if an absorbed intermediate has any other reader. Decode only (one token, one
+-// sequence); prefill graphs are untouched. Both off by default.
++// sequence); prefill graphs are untouched. Both on by default (bit-identical); =0 turns either off.
+ //   GGML_METAL_OPT_GDNPREP=1: SCALE(RMS_NORM(q)), SCALE(RMS_NORM(k)), MUL(softplus(ADD(alpha, dt)), A), sigmoid(beta)
+ //                             -> computed inside the GATED_DELTA_NET kernel (src 6..9 = q raw, k raw, alpha, beta raw)
+ //   GGML_METAL_OPT_NGATED=1:  MUL(MUL(RMS_NORM(x), w), sigmoid|silu(z)) -> one row kernel at the final MUL (src 2..4 = x, w, z)
+ // =====================================================================================================
+ 
+ static bool s2_env(const char * name) { const char * e = getenv(name); return e && atoi(e) != 0; }
+-static bool s2_opt_gdnprep() { static int v = -1; if (v < 0) v = s2_env("GGML_METAL_OPT_GDNPREP"); return v; }
+-static bool s2_opt_ngated()  { static int v = -1; if (v < 0) v = s2_env("GGML_METAL_OPT_NGATED");  return v; }
++// on by default (bit-identical); GGML_METAL_OPT_GDNPREP=0 / GGML_METAL_OPT_NGATED=0 turn them off
++static bool s2_env_on(const char * name) { const char * e = getenv(name); return !e || atoi(e) != 0; }
++static bool s2_opt_gdnprep() { static int v = -1; if (v < 0) v = s2_env_on("GGML_METAL_OPT_GDNPREP"); return v; }
++static bool s2_opt_ngated()  { static int v = -1; if (v < 0) v = s2_env_on("GGML_METAL_OPT_NGATED");  return v; }
+ static int  s2_prep_mask()   { static int v = -1; if (v < 0) { const char * e = getenv("GGML_METAL_S2_PREP_MASK"); v = e ? atoi(e) : 15; } return v; }   // diagnostic: bit 0 q, 1 k, 2 gate, 3 beta (default 15 = all)
+ static bool s2_debug()       { static int v = -1; if (v < 0) v = s2_env("GGML_METAL_S2_DEBUG");    return v; }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

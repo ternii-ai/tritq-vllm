@@ -1,0 +1,269 @@
+From 320e51434870aa73f6f7edb89acb01e5b4fedb76 Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:00:03 +0000
+Subject: [PATCH 21/22] ggml-metal: conv state gather, concat and write-back in
+ one kernel
+
+In a one-token, one-sequence decode graph, build_conv_state runs three
+dispatches per gated-delta-net layer: GET_ROWS of the conv state from
+the cache, CONCAT with the new token, and a CPY of the shifted state
+back into the cache. They are now one copy kernel at the CONCAT; the
+GET_ROWS and the CPY emit nothing. Each thread reads all of its own
+values before it writes any, so the write-back may target the row it
+read. Pure copies, so output is bit-identical.
+GGML_METAL_OPT_CONVRS=0 turns it off.
+---
+ ggml/src/ggml-metal/ggml-metal-impl.h      |  10 ++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp     | 114 ++++++++++++++++++++-
+ ggml/src/ggml-metal/ggml-metal-ops.h       |   2 +
+ ggml/src/ggml-metal/kernels/quantize.metal |  34 ++++++
+ 4 files changed, 155 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index e08a35e68..d3eac5006 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -1027,6 +1027,16 @@ typedef struct {
+     uint64_t rs_nb;  // > 0: read the state from the recurrent cache row rs_ids[seq] (row stride rs_nb bytes), not from s
+ } ggml_metal_kargs_gated_delta_net;
+ 
++// TQ: conv-state gather + concat + state write-back in one kernel (GGML_METAL_OPT_CONVRS)
++typedef struct {
++    int32_t  n_ch;      // channels (rows of the concat)
++    int32_t  km1;       // conv kernel size - 1 (state columns)
++    uint64_t cache_nb;  // bytes per cache row
++    uint64_t nb10;      // new-token view: bytes per token
++    uint64_t nb11;      // new-token view: bytes per channel
++    uint64_t nb1;       // concat output: bytes per channel
++} ggml_metal_kargs_s2_conv_cat;
++
+ // TQ step-2: GDN input prep folded into the GDN kernel (GGML_METAL_OPT_GDNPREP)
+ typedef struct {
+     int32_t  ne00q;         // q/k head width (128): the stock RMS_NORM divides by this runtime value
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index bb25d07e9..69ee69dc5 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -105,7 +105,7 @@ struct ggml_metal_op {
+         // TQ step-2: a stock fusion group must not swallow a node absorbed by a step-2 fusion
+         if (f && *n_out > 1) {
+             for (int j = 1; j < *n_out; ++j) {
+-                if (ggml_graph_node(gf, idxs[i0 + j])->flags & (GGML_METAL_S2_ELIDE | GGML_METAL_S2_NGATED)) {
++                if (ggml_graph_node(gf, idxs[i0 + j])->flags & (GGML_METAL_S2_ELIDE | GGML_METAL_S2_NGATED | GGML_METAL_S2_CONVRS)) {
+                     *n_out = 1;
+                     return nullptr;
+                 }
+@@ -275,7 +275,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+         }
+ 
+         // the state read-through reads the recurrent cache, which the range tracker does not see as a source
+-        if (node->flags & GGML_METAL_S2_RSREAD) {
++        if (node->flags & (GGML_METAL_S2_RSREAD | GGML_METAL_S2_CONVRS)) {
+             is_concurrent = false;
+         }
+ 
+@@ -323,6 +323,8 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+ 
+     if (node->flags & GGML_METAL_S2_NGATED) {
+         n_fuse = ggml_metal_op_s2_norm_gated(ctx, idx);   // TQ step-2
++    } else if (node->flags & GGML_METAL_S2_CONVRS) {
++        n_fuse = ggml_metal_op_s2_conv_cat(ctx, idx);     // TQ conv-state read-through
+     } else
+     switch (node->op) {
+         case GGML_OP_CONCAT:
+@@ -6162,6 +6164,7 @@ static bool s2_env_on(const char * name) { const char * e = getenv(name); return
+ static bool s2_opt_gdnprep() { static int v = -1; if (v < 0) v = s2_env_on("GGML_METAL_OPT_GDNPREP"); return v; }
+ static bool s2_opt_ngated()  { static int v = -1; if (v < 0) v = s2_env_on("GGML_METAL_OPT_NGATED");  return v; }
+ static bool s2_opt_rsread()  { static int v = -1; if (v < 0) v = s2_env_on("GGML_METAL_OPT_RSREAD");  return v; }
++static bool s2_opt_convrs()  { static int v = -1; if (v < 0) v = s2_env_on("GGML_METAL_OPT_CONVRS");  return v; }
+ static int  s2_prep_mask()   { static int v = -1; if (v < 0) { const char * e = getenv("GGML_METAL_S2_PREP_MASK"); v = e ? atoi(e) : 15; } return v; }   // diagnostic: bit 0 q, 1 k, 2 gate, 3 beta (default 15 = all)
+ static bool s2_debug()       { static int v = -1; if (v < 0) v = s2_env("GGML_METAL_S2_DEBUG");    return v; }
+ 
+@@ -6363,19 +6366,120 @@ static int s2_plan_rsread(ggml_cgraph * gf, void * user_data, void (*add_alloc_d
+     return n_ok;
+ }
+ 
++// the GET_ROWS that gathers a CONCAT's first input (the conv state) from the recurrent cache, or nullptr
++static ggml_tensor * s2_conv_gather(const ggml_tensor * c) {
++    ggml_tensor * t = c->src[0];
++    while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW)) {
++        if (t->op == GGML_OP_VIEW && t->view_offs != 0) return nullptr;
++        t = t->src[0];
++    }
++    return t && t->op == GGML_OP_GET_ROWS ? t : nullptr;
++}
++
++static bool s2_in_cache(const ggml_tensor * t) {
++    const ggml_tensor * base = t->view_src ? t->view_src : t;
++    return base->buffer != nullptr && ggml_backend_buffer_get_usage(base->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE;
++}
++
++// conv-state read-through (build_conv_state, n_rs_seq = 0): in a one-token, one-sequence decode graph
++//   GET_ROWS(conv cache, ids) -> CONCAT(state, new token) -> CPY(last km1 columns -> cache row)
++// becomes one kernel at the CONCAT (GET_ROWS and CPY emit nothing). The CPY node is kept in op_params[2..3] of the CONCAT.
++// As for the state read-through, the ids stay alive until the CONCAT in every graph with this pattern.
++static int s2_plan_convrs(ggml_cgraph * gf, void * user_data, void (*add_alloc_dep)(void *, struct ggml_tensor *, struct ggml_tensor *)) {
++    int n_ok = 0;
++    for (int i = 0; i < gf->n_nodes; ++i) {
++        ggml_tensor * c = gf->nodes[i];
++        if (c->op != GGML_OP_CONCAT || (c->flags & GGML_METAL_S2_CONVRS) || ggml_get_op_params_i32(c, 0) != 0) continue;
++        ggml_tensor * G = s2_conv_gather(c);
++        if (!G || !G->src[0] || !G->src[1]) continue;
++        ggml_tensor * ids = G->src[1];
++        if (add_alloc_dep) add_alloc_dep(user_data, ids, c);
++        const ggml_tensor * st = c->src[0];
++        const ggml_tensor * x1 = c->src[1];
++        // the CPY of the shifted state back into the cache
++        ggml_tensor * cpy = nullptr;
++        bool many = false;
++        auto it = s2_consumers.find(c);
++        if (it != s2_consumers.end()) {
++            for (const ggml_tensor * nj : it->second) {
++                if (nj->op == GGML_OP_CPY && nj->src[0] && nj->src[0]->op == GGML_OP_VIEW && nj->src[0]->src[0] == c) {
++                    if (cpy && cpy != nj) many = true;
++                    cpy = (ggml_tensor *) nj;
++                }
++            }
++        }
++        if (!cpy || many) continue;
++        const ggml_tensor * sv = cpy->src[0];   // view of the concat: the last km1 columns
++        const ggml_tensor * sd = cpy->src[1];   // cache row
++        const int64_t km1 = st->ne[0];
++        const int64_t nch = st->ne[1];
++        bool ok = c->type == GGML_TYPE_F32 && st->type == GGML_TYPE_F32 && x1->type == GGML_TYPE_F32 && G->type == GGML_TYPE_F32 &&
++                  G->src[0]->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && ids->ne[0] >= 1 &&
++                  km1 >= 1 && km1 <= 8 && c->ne[0] == km1 + 1 && c->ne[1] == nch && c->ne[2] == 1 && c->ne[3] == 1 &&
++                  ggml_is_contiguous(c) && ggml_is_contiguous(st) && st->ne[2] == 1 && st->ne[3] == 1 &&
++                  x1->ne[0] == 1 && x1->ne[1] == nch && x1->ne[2] == 1 && x1->ne[3] == 1 &&
++                  G->ne[0] == km1*nch && G->ne[1] == 1 && G->ne[2] == 1 && G->ne[3] == 1 && ggml_is_contiguous(G) &&
++                  G->src[0]->nb[0] == sizeof(float) && G->src[0]->ne[0] == G->ne[0] && s2_in_cache(G->src[0]) &&
++                  sv->ne[0] == km1 && sv->ne[1] == nch && sv->ne[2] == 1 && sv->ne[3] == 1 && sv->nb[1] == c->nb[1] &&
++                  sv->view_offs == sizeof(float) && sv->type == GGML_TYPE_F32 &&
++                  sd->type == GGML_TYPE_F32 && ggml_is_contiguous(sd) && ggml_nelements(sd) == km1*nch && s2_in_cache(sd) &&
++                  !(cpy->flags & GGML_TENSOR_FLAG_OUTPUT) && !(G->flags & GGML_TENSOR_FLAG_OUTPUT);
++        if (!ok) continue;
++        // no reader of the CPY result, and the gathered state reaches nothing but this CONCAT
++        if (s2_consumers.count(cpy) && !s2_rs_only_consumer(cpy, nullptr)) continue;
++        if (!s2_rs_only_consumer(G, c)) continue;
++        G->flags   |= GGML_METAL_S2_ELIDE;
++        cpy->flags |= GGML_METAL_S2_ELIDE;
++        c->flags   |= GGML_METAL_S2_CONVRS;
++        memcpy((char *) c->op_params + 8, &cpy, sizeof(cpy));
++        n_ok++;
++    }
++    return n_ok;
++}
++
++int ggml_metal_op_s2_conv_cat(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * c = ctx->node(idx);
++    const ggml_tensor * G = s2_conv_gather(c);
++    const ggml_tensor * cpy = nullptr;
++    memcpy(&cpy, (const char *) c->op_params + 8, sizeof(cpy));
++    GGML_ASSERT(G && cpy && cpy->op == GGML_OP_CPY);
++    const ggml_tensor * x1 = c->src[1];
++    ggml_metal_kargs_s2_conv_cat args = {};
++    args.n_ch     = (int32_t) c->ne[1];
++    args.km1      = (int32_t) c->src[0]->ne[0];
++    args.cache_nb = G->src[0]->nb[1];
++    args.nb10     = x1->nb[0];
++    args.nb11     = x1->nb[1];
++    args.nb1      = c->nb[1];
++    const char * kname = "kernel_s2_conv_cat_f32";
++    auto pl = ggml_metal_library_get_pipeline(ctx->lib, kname);
++    if (!pl.pipeline) pl = ggml_metal_library_compile_pipeline(ctx->lib, kname, kname, nullptr);
++    ggml_metal_encoder_set_pipeline(ctx->enc, pl);
++    ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(G->src[0]),   1); // cache
++    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(G->src[1]),   2); // ids
++    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(x1),          3); // new token
++    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(c),           4); // concat
++    ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(cpy->src[1]), 5); // cache row (shifted state)
++    const int nth = 256;
++    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (args.n_ch + nth - 1)/nth, 1, 1, nth, 1, 1);
++    return 1;
++}
++
+ void ggml_metal_s2_plan(ggml_cgraph * gf, void * user_data, void (*add_alloc_dep)(void *, struct ggml_tensor *, struct ggml_tensor *)) {
+     // GDNPREP / NGATED keep their inputs alive with extra sources (all graphs), see s2_plan_gdnprep; RSREAD uses add_alloc_dep
+-    const bool gp = s2_opt_gdnprep(), ng = s2_opt_ngated(), rr = s2_opt_rsread();
+-    if (!gp && !ng && !rr) return;
++    const bool gp = s2_opt_gdnprep(), ng = s2_opt_ngated(), rr = s2_opt_rsread(), cr = s2_opt_convrs();
++    if (!gp && !ng && !rr && !cr) return;
+     const int64_t t0 = ggml_time_us();
+     s2_build_consumers(gf);
+     const int a = gp ? s2_plan_gdnprep(gf) : 0;
+     if (a > 0) s2_build_consumers(gf);   // GDNPREP added sources
+     const int b = ng ? s2_plan_ngated(gf)  : 0;
+     const int n_dep = rr ? s2_plan_rsread(gf, user_data, add_alloc_dep) : 0;
++    const int n_cr  = cr ? s2_plan_convrs(gf, user_data, add_alloc_dep) : 0;
+     if (s2_debug()) {
+         static int n_print = 0;
+-        if (n_print++ < 64) fprintf(stderr, "[tq-s2] plan (n_nodes %d): gdnprep %d, ngated %d, rsread %d, %.3f ms\n", gf->n_nodes, a, b, n_dep, (ggml_time_us() - t0)/1000.0);
++        if (n_print++ < 64) fprintf(stderr, "[tq-s2] plan (n_nodes %d): gdnprep %d, ngated %d, rsread %d, convrs %d, %.3f ms\n", gf->n_nodes, a, b, n_dep, n_cr, (ggml_time_us() - t0)/1000.0);
+     }
+ }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index db0781c0b..c7d915c14 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -13,9 +13,11 @@ typedef struct ggml_metal_op * ggml_metal_op_t;
+ #define GGML_METAL_S2_GDNPREP (1 << 25) // GATED_DELTA_NET with its q/k l2 norms, gate and beta folded in (GGML_METAL_OPT_GDNPREP)
+ #define GGML_METAL_S2_NGATED  (1 << 26) // final MUL of RMS_NORM(x)*w*gate(z), does all three (GGML_METAL_OPT_NGATED)
+ #define GGML_METAL_S2_RSREAD  (1 << 27) // GATED_DELTA_NET reads its state straight from the recurrent cache row (GGML_METAL_OPT_RSREAD)
++#define GGML_METAL_S2_CONVRS  (1 << 28) // CONCAT of the conv state: gathers from the cache and writes the shifted state back (GGML_METAL_OPT_CONVRS)
+ 
+ void ggml_metal_s2_plan(struct ggml_cgraph * gf, void * user_data, void (*add_alloc_dep)(void *, struct ggml_tensor *, struct ggml_tensor *));
+ int  ggml_metal_op_s2_norm_gated(ggml_metal_op_t ctx, int idx);
++int  ggml_metal_op_s2_conv_cat  (ggml_metal_op_t ctx, int idx);
+ 
+ struct ggml_metal_fusion; // forward decl (ggml-metal-device.h)
+ 
+diff --git a/ggml/src/ggml-metal/kernels/quantize.metal b/ggml/src/ggml-metal/kernels/quantize.metal
+index 06304861c..a7267d2d7 100644
+--- a/ggml/src/ggml-metal/kernels/quantize.metal
++++ b/ggml/src/ggml-metal/kernels/quantize.metal
+@@ -200,6 +200,40 @@ kernel void kernel_concat(
+     }
+ }
+ 
++// TQ (GGML_METAL_OPT_CONVRS): one-token decode, one sequence. Thread ch gathers its km1 conv-state values from the cache row
++// ids[0], writes the concat row [state..., new token] and the shifted state [state[1..], new token] back to the cache row
++// (dst_state). Pure copies; each thread reads all of its own values before it writes any, so dst_state may be the row it read.
++kernel void kernel_s2_conv_cat_f32(
++        constant ggml_metal_kargs_s2_conv_cat & args,
++        device const char    * cache,
++        device const int32_t * ids,
++        device const char    * src1,
++        device       char    * dst,
++        device       char    * dst_state,
++        uint tpig[[thread_position_in_grid]]) {
++    const int ch = tpig;
++    if (ch >= args.n_ch) {
++        return;
++    }
++    const int km1 = args.km1;
++    device const float * row = (device const float *) (cache + (uint64_t) ids[0]*args.cache_nb) + ch*km1;
++    float x[8];
++    for (int j = 0; j < km1; ++j) {
++        x[j] = row[j];
++    }
++    const float v = *((device const float *) (src1 + ch*args.nb11));
++    device float * y = (device float *) (dst + ch*args.nb1);
++    for (int j = 0; j < km1; ++j) {
++        y[j] = x[j];
++    }
++    y[km1] = v;
++    device float * s = (device float *) dst_state + ch*km1;
++    for (int j = 0; j + 1 < km1; ++j) {
++        s[j] = x[j + 1];
++    }
++    s[km1 - 1] = v;
++}
++
+ typedef decltype(kernel_concat<float>) kernel_concat_t;
+ 
+ template [[host_name("kernel_concat_f32")]]  kernel kernel_concat_t kernel_concat<float>;
+-- 
+2.54.0 (Apple Git-157)
+

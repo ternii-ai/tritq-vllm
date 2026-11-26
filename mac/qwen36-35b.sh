@@ -8,7 +8,8 @@
 # On a Mac with less than 24 GB the experts stay on the SSD behind an expert cache; with 24 GB or more the model runs fully in memory.
 # Options (environment variables): TR_DIR (install folder), TR_PORT (default 8080), TR_CACHE_MIB (expert cache below 24 GB, default 8400),
 # TR_CTX (context window, default 4096), TR_THINK=1 (let the model think before answering; slower), TR_NO_START=1 (download only),
-# TR_NGRAM=0 (turn off n-gram drafting, which is on by default: it speeds up answers that repeat text from the prompt, such as code edits).
+# TR_NGRAM=0 (turn off n-gram drafting, which is on by default: it speeds up answers that repeat text from the prompt, such as code edits),
+# TR_MTP=0 (turn off MTP drafting and skip its 1-1.3 GB download; on by default: a small multi-token-prediction head drafts the next tokens).
 set -euo pipefail
 { # the whole script is one block, so a cut-off download of this file runs nothing
 
@@ -16,9 +17,9 @@ DIR=${TR_DIR:-$HOME/qwen36-35b-tr}
 PORT=${TR_PORT:-8080}
 CACHE=${TR_CACHE_MIB:-8400}
 CTX=${TR_CTX:-4096}
-REL=llama.cpp-tr-b11721-r4
+REL=llama.cpp-tr-b11721-r7
 BIN_URL=https://github.com/ternii-ai/tritq-vllm/releases/download/$REL/llama.cpp-tr-macos-arm64.tar.gz
-BIN_SHA=4f2d890f4c2ff444df5fa5ca66ab94e29e314b6e16ca94a8c296e7dc66708e8e
+BIN_SHA=1e4539c60644f0fb75870945280505886768663303994a6ad3ed642567d4c582
 HF=https://huggingface.co/Ternii/Qwen3.6-35B-A3B-TR2.25-G-GGUF/resolve/main
 MODEL=Qwen3.6-35B-A3B-TR2.25-G
 # name  size  sha256
@@ -36,6 +37,18 @@ OSV=$(sw_vers -productVersion); OSMAJ=${OSV%%.*}; OSMIN=$(echo "$OSV" | cut -d. 
 { [ "$OSMAJ" -gt 13 ] || { [ "$OSMAJ" -eq 13 ] && [ "${OSMIN:-0}" -ge 3 ]; }; } || die "macOS 13.3 or later is needed (this Mac: $OSV)."
 RAM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 [ "$RAM_GB" -ge 16 ] || die "this model needs a Mac with at least 16 GB of memory (this Mac: $RAM_GB GB)."
+# MTP drafting: Qwen's own multi-token-prediction layer with this model's embedding and output head, as a separate small file;
+# 24 GB and up: Q8_0, 2 draft tokens; below 24 GB: Q4_K (the Q8_0 file would push layers off the GPU), 1 draft token.
+MTP=""
+if [ "${TR_MTP:-1}" != 0 ]; then
+  if [ "$RAM_GB" -lt 24 ]; then
+    MTP=$MODEL-MTP-Q4_K_M.gguf; MTP_N=1; MTP_LINE="$MTP 1090053952 5286c8d763ba162121d3c0d7b9cd890117e7ae76fcc05d3690f08730f393d058"
+  else
+    MTP=$MODEL-MTP-Q8_0.gguf; MTP_N=2; MTP_LINE="$MTP 1442359104 30444ab0f1b30706290f930177138ff2818960555262ed008382704cc46585ec"
+  fi
+  FILES="$FILES$MTP_LINE
+"
+fi
 mkdir -p "$DIR/model"
 NEED=0
 while read -r n s h; do
@@ -84,10 +97,13 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN > /dev/null 2>&1; then die "port $PORT is
 RS=(--reasoning off); [ -n "${TR_THINK:-}" ] && RS=()
 # n-gram drafting: guesses the next tokens from text already in the conversation and has the model check them in one batch
 # (measured: about 1.5x on code edits with the whole model in memory, +35 % on a 16 GB MacBook Air, no change on new text)
-NG=(--spec-type ngram-mod); [ "${TR_NGRAM:-1}" = 0 ] && NG=()
+# MTP drafting (see above) predicts the next tokens with a small extra layer; both kinds of drafts are checked by the full model
+SPEC=""; [ "${TR_NGRAM:-1}" != 0 ] && SPEC=ngram-mod; [ -n "$MTP" ] && SPEC=${SPEC:+$SPEC,}draft-mtp
+NG=(); [ -n "$SPEC" ] && NG=(--spec-type "$SPEC"); [ -n "$MTP" ] && NG+=(-md "$DIR/model/$MTP" --spec-draft-n-max "$MTP_N")
+MEM_GB=12; [ -n "$MTP" ] && MEM_GB=13
 if [ "$RAM_GB" -lt 24 ]; then
   MOE=(LLAMA_MOE_SSD=1 LLAMA_MOE_CACHE_MIB="$CACHE" LLAMA_MOE_CACHE_MAX_BATCH=512 LLAMA_MOE_ASYNC=1 GGML_SCHED_COPY_CB_FIRST=1)
-  say "Starting the model with the experts on the SSD ($RAM_GB GB Mac). Close other large apps first: it uses about 12 GB."
+  say "Starting the model with the experts on the SSD ($RAM_GB GB Mac). Close other large apps first: it uses about ${MEM_GB:-12} GB."
 else
   MOE=(); say "Starting the model fully in memory ($RAM_GB GB Mac)."
 fi
