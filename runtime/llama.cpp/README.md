@@ -37,7 +37,7 @@ No build needed: the [`llama.cpp-tr-b11721-r7` release](https://github.com/terni
 DGX Spark, sm_121, which needs the CUDA 13 runtime; without it the CPU is used). There is no x86-64 archive: build from source with `apply.sh`.
 Earlier releases: [r6](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r6) (0001-0018, macOS and Linux arm64),
 [r5](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r5) (0001-0012, macOS and Linux arm64),
-[r4](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r4) (0001-0011, macOS and Linux arm64; the Qwen3.8-Flash-Next 16 GB installer uses it),
+[r4](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r4) (0001-0011, macOS and Linux arm64),
 [r3](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r3) (0001-0007, macOS arm64),
 [r2](https://github.com/ternii-ai/tritq-vllm/releases/tag/llama.cpp-tr-b11721-r2) (0001-0006, macOS and Linux arm64, CPU only).
 Each archive has `llama-server` (with the web UI), `llama-cli`, `llama-completion`, `llama-bench`, `llama-perplexity` and `test-backend-ops`.
