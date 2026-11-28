@@ -11,16 +11,18 @@
 # 128 GB and up: the whole model in memory, all 10 experts.
 # Options (environment variables): TR_DIR (install folder), TR_PORT (default 8080), TR_CACHE_MIB (expert cache; forces the SSD mode),
 # TR_CTX (context window, default 32768; up to 262144), TR_THINK=1 (let the model think before answering; slower), TR_NO_START=1 (download only),
-# TR_NGRAM=0 (turn off n-gram drafting, which is on by default: it speeds up answers that repeat text from the prompt, such as code edits).
+# TR_NGRAM=0 (turn off n-gram drafting, which is on by default: it speeds up answers that repeat text from the prompt, such as code edits),
+# TR_MTP=0 (128 GB Macs only: turn off MTP drafting and skip its 2.7 GB download; on by default there: a small multi-token-prediction head
+# drafts the next token).
 set -euo pipefail
 { # the whole script is one block, so a cut-off download of this file runs nothing
 
 DIR=${TR_DIR:-$HOME/qwen38-tr}
 PORT=${TR_PORT:-8080}
 CTX=${TR_CTX:-32768}
-REL=llama.cpp-tr-b11721-r7
+REL=llama.cpp-tr-b11721-r8
 BIN_URL=https://github.com/ternii-ai/tritq-vllm/releases/download/$REL/llama.cpp-tr-macos-arm64.tar.gz
-BIN_SHA=1e4539c60644f0fb75870945280505886768663303994a6ad3ed642567d4c582
+BIN_SHA=9657b7aec5add89fc3b367d81418a4e2455cbed14f3534790a2ca5f134d57e36
 HF=https://huggingface.co/Ternii/Qwen3.8-Flash-Next-TR2.31-G-GGUF/resolve/main
 MODEL=Qwen3.8-Flash-Next-TR2.31-G
 # name  size  sha256
@@ -35,6 +37,14 @@ Qwen3.8-Flash-Next-TR2.31-G-00007-of-00008.gguf 9687572416 29236756f165e5159f244
 Qwen3.8-Flash-Next-TR2.31-G-00008-of-00008.gguf 3791556448 84a0cdc9a06010aedacd2801c1183e65ac128e85d10e09623ef31f577e0290bf
 Qwen3.8-Flash-Next-TR2.31-G.trpw 120680652 79cc1c8258622362688196b1832bd352339d4c3b51e152126888a23aaa866ddf
 "
+# MTP drafting (128 GB and up, whole model in memory): Qwen's own multi-token-prediction layer (Q4_K_M) with this model's embedding and
+# output head, as a separate file. Not used with the experts on the SSD (below 128 GB): there each check reads extra experts and it is slower.
+MTP=""
+if [ "$(( $(sysctl -n hw.memsize) / 1073741824 ))" -ge 128 ] && [ -z "${TR_CACHE_MIB:-}" ] && [ "${TR_MTP:-1}" != 0 ]; then
+  MTP=$MODEL-MTP-Q4_K_M.gguf
+  FILES="$FILES$MTP 2701776192 d37fb5f2086f7dce3ebf17faffd17feb08846c0acc7f030660fc105b8ab07d94
+"
+fi
 
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
 die() { printf '\033[31mError: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -94,7 +104,9 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN > /dev/null 2>&1; then die "port $PORT is
 RS=(--reasoning off); [ -n "${TR_THINK:-}" ] && RS=()
 # n-gram drafting: guesses the next tokens from text already in the conversation and has the model check them in one batch
 # (measured: about 2x on code edits with the whole model in memory, +19 % on a 16 GB MacBook Air, no change on new text)
-NG=(--spec-type ngram-mod); [ "${TR_NGRAM:-1}" = 0 ] && NG=()
+# MTP drafting (see above) predicts the next token with a small extra layer; both kinds of drafts are checked by the full model
+SPEC=""; [ "${TR_NGRAM:-1}" != 0 ] && SPEC=ngram-mod; [ -n "$MTP" ] && SPEC=${SPEC:+$SPEC,}draft-mtp
+NG=(); [ -n "$SPEC" ] && NG=(--spec-type "$SPEC"); [ -n "$MTP" ] && NG+=(-md "$DIR/model/$MTP" --spec-draft-n-max 1)
 # memory plan (measured on Apple silicon; wired memory in brackets): <48 GB 6,600 MiB cache at 32k, 8 experts (13.4 GB);
 # 48-63 GB 22,000 MiB, 10 experts (32 GB); 64-127 GB 35,000 MiB, 10 experts (46 GB); 128 GB+ whole model in memory, 10 experts
 # prefill in batches of 2,048 tokens on 48 GB and up (measured: long prompts read +23-36 % faster in memory, +14-74 % in the cache modes);
@@ -104,11 +116,15 @@ NG=(--spec-type ngram-mod); [ "${TR_NGRAM:-1}" = 0 ] && NG=()
 PF=(-ub 2048 -b 2048); PE=(GGML_METAL_TQD_MM=1); MB=2048
 if [ "$RAM_GB" -ge 128 ] && [ -z "${TR_CACHE_MIB:-}" ]; then
   MODE=(-fit off)
-  say "Starting the model fully in memory ($RAM_GB GB Mac, all 10 experts). Loading reads about 90 GB from the SSD the first time."
+  say "Starting the model fully in memory ($RAM_GB GB Mac, all 10 experts${MTP:+, MTP drafting}). Loading reads about 90 GB from the SSD the first time."
 else
   if [ "$RAM_GB" -ge 64 ]; then CACHE=35000; XP=(LLAMA_MOE_EXPERTS=0)
   elif [ "$RAM_GB" -ge 48 ]; then CACHE=22000; XP=(LLAMA_MOE_EXPERTS=0)
-  else XP=()
+  else
+    # below 48 GB also: segmented LRU for the expert cache and, for prompt batches of 1,024 tokens or more, the next layer's experts
+    # read from the SSD while the GPU runs this one (same answers; measured on a 16 GB MacBook Air: decode +3 %, 2,048-token prompts
+    # read about 1.5x faster)
+    XP=(LLAMA_MOE_SLRU=0.7 LLAMA_MOE_PF_ALL=1024)
     # 16 GB plan (MiB): GPU memory = 3,059 model + cache + context + prefill buffers, kept within 10,987 (llama.cpp's own fit target)
     if   [ "$CTX" -le 4096 ];   then CACHE=6700
     elif [ "$CTX" -le 32768 ];  then CACHE=6600

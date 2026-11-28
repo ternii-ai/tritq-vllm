@@ -1,0 +1,58 @@
+From f0b5b724bd504be57cdffa2bb78876a3cd798364 Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 22:42:24 +0000
+Subject: [PATCH 24/26] llama: MoE expert cache: LLAMA_MOE_PF_ALL - read the
+ next layer's uncached experts during large ubatches
+
+LLAMA_MOE_PF_ALL=N (tokens, default 0 = off): for a ubatch of at least
+N tokens, after layer il's experts are resolved, read every expert of
+layer il + 1 that is not cached while the GPU runs layer il (a prompt
+batch that large selects most experts of every layer). Acts only with
+the asynchronous SSD expert cache and a cache that holds at least 3
+layers' worth of experts. Only the order and timing of the reads
+change, never a computed value.
+---
+ src/llama-moe-cache.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index f598da3ac..b0725a67b 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -430,6 +430,7 @@ struct llama_moe_cache::impl {
+     // (tq expert cache) LLAMA_MOE_PRED=1 logs, =2 prefetches: the graph computes the router of layer il + 1 on the FFN input of
+     // layer il; after "go" of layer il the resolver reads the predicted misses of layer il + 1 while the GPU runs on
+     int pred_mode = 0;
++    long pf_all_min = 0; // LLAMA_MOE_PF_ALL (tokens, 0 = off)
+     int32_t pred_k_ = 0;
+     std::vector<ggml_tensor *> pred_t;              // [il] tensor predicting layer il
+     std::vector<std::vector<int32_t>> pred_ids;     // [il] predicted experts, read after "done" of layer il - 1
+@@ -478,6 +479,7 @@ struct llama_moe_cache::impl {
+             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+         // prefetch is on by default (it only acts with the SSD async cache, see pred_k()); 6 experts measured best on a 16 GB MacBook Air
+         pred_mode = (int) moe_env_long("LLAMA_MOE_PRED", 2);
++        pf_all_min = moe_env_long("LLAMA_MOE_PF_ALL", 0);
+         pred_k_   = pred_mode > 0 ? (int32_t) moe_env_long("LLAMA_MOE_PRED_K", 6) : 0;
+         pred_t.assign(model.layers.size(), nullptr);
+         pred_ids.assign(model.layers.size(), {});
+@@ -1061,6 +1063,17 @@ struct llama_moe_cache::impl {
+             }
+             if (use_pred && pred_mode >= 2) {
+                 prefetch(il_next);
++            } else if (pf_all_min > 0 && j.n_ids >= (int64_t) pf_all_min*n_expert_used && il_next < (int32_t) layers.size() && layers[il_next].ig >= 0 &&
++                       groups[layers[il_next].ig].n_slots >= 3*(int32_t) groups[layers[il_next].ig].lru.n_expert) {
++                // (tq expert cache) LLAMA_MOE_PF_ALL=N: a ubatch of at least N tokens selects most experts of every layer (prefill), so read
++                // all experts of the next layer that are not cached while the GPU runs this layer's experts (they are needed or cheap to hold)
++                auto & pi = pred_ids[il_next];
++                pi.resize(groups[layers[il_next].ig].lru.n_expert);
++                for (int32_t e = 0; e < (int32_t) pi.size(); ++e) {
++                    pi[e] = e;
++                }
++                pred_gen[il_next] = (uint64_t) -1;
++                prefetch(il_next);
+             }
+             const int64_t stall = moe_now_ns() - t1;
+             (j.n_ids <= 8*n_expert_used ? stall_ns_small : stall_ns_large) += stall;
+-- 
+2.54.0 (Apple Git-157)
+

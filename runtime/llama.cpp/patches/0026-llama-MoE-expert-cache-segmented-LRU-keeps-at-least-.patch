@@ -1,0 +1,36 @@
+From a994f6caa22820182af5ccd2a7ee015356925a7f Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 11:30:01 +0000
+Subject: [PATCH 26/26] llama: MoE expert cache: segmented LRU keeps at least
+ one layer of experts evictable
+
+With LLAMA_MOE_SLRU every miss enters the unprotected segment and is
+evicted from its head. If that segment holds fewer slots than a layer
+has experts (a protected share above about 0.83, or a small cache), a
+large prompt batch could evict its own new experts, including ones it
+still needed. The protected share is now capped so that at least
+n_expert slots stay unprotected. At LLAMA_MOE_SLRU=0.7 with the 16 GB
+settings (2,962 slots, 512 experts per layer) nothing changes.
+---
+ src/llama-moe-cache.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index a4b06afd6..2f1eb24be 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -66,6 +66,11 @@ struct moe_cache_lru {
+         head_[0] = 0; tail_[0] = n_slots - 1; cnt[0] = n_slots;
+         head_[1] = -1; tail_[1] = -1; cnt[1] = 0;
+         prot_cap = prot_frac > 0.0 ? (int32_t) (prot_frac*n_slots) : 0;
++        // the misses of one plan() all go to segment 0 and are evicted from its head: if segment 0 can hold fewer slots than a layer has
++        // experts, a large ubatch would evict its own new experts (and the slot of an expert it still needs). Keep at least n_expert there.
++        if (prot_cap > 0 && prot_cap > n_slots - n_expert) {
++            prot_cap = std::max(n_slots - n_expert, 0);
++        }
+         head = victim();
+         seen.assign(n_expert, 0);
+     }
+-- 
+2.54.0 (Apple Git-157)
+

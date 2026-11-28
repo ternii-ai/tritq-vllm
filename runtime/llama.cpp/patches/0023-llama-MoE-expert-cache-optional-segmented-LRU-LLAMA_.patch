@@ -1,0 +1,152 @@
+From cec11e50bb358e03fb09bd163c8eeaaebabdc68c Mon Sep 17 00:00:00 2001
+From: Wai Chung <351198037+ternii-ai@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 21:08:09 +0000
+Subject: [PATCH 23/26] llama: MoE expert cache: optional segmented LRU
+ (LLAMA_MOE_SLRU, default off)
+
+LLAMA_MOE_SLRU=f (0 < f <= 0.95) splits the expert cache's LRU list in
+two segments: a hit moves the slot to a protected segment of at most
+f x slots (its least recently used slot falls back to the probation
+segment), new experts enter the probation segment and are evicted from
+its head first. Only which experts stay cached changes, never a
+computed value. Unset (the default) keeps the plain LRU, with the same
+cache decisions as before.
+---
+ src/llama-moe-cache.cpp | 83 +++++++++++++++++++++++++++++++----------
+ 1 file changed, 63 insertions(+), 20 deletions(-)
+
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 79be3f11d..f598da3ac 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -34,48 +34,85 @@ struct moe_cache_lru {
+     std::vector<int32_t *> slot_map; // [n_layer] data of the slot maps, -1 if the expert is not cached
+     std::vector<int32_t>   key_of;   // [n_slots] il*n_expert + expert, -1 if empty
+ 
+-    // doubly linked list of the slots, head is the least recently used
++    // doubly linked lists of the slots, head = least recently used. Segment 0 holds everything with the plain LRU (prot_cap 0, the
++    // default); with LLAMA_MOE_SLRU=f (segmented LRU) a hit moves a slot to segment 1 ("protected", at most prot_cap slots, its least
++    // recently used slot falls back to the tail of segment 0), new experts enter segment 0 and are evicted from its head first.
++    // Only which experts stay cached changes, never a computed value.
+     std::vector<int32_t> prev;
+     std::vector<int32_t> next;
+-    int32_t head = -1;
+-    int32_t tail = -1;
++    std::vector<uint8_t> seg;
++    int32_t head_[2] = { -1, -1 };
++    int32_t tail_[2] = { -1, -1 };
++    int32_t cnt[2]   = { 0, 0 };
++    int32_t prot_cap = 0;
++    int32_t head = -1; // = victim(), kept for the callers that read it
+ 
+     std::vector<uint32_t> seen; // [n_expert]
+     uint32_t seen_gen = 0;
+     std::vector<int32_t> uniq;
+ 
+-    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
++    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots, double prot_frac = 0.0) {
+         this->n_expert = n_expert;
+         this->n_slots  = n_slots;
+         slot_map.assign(n_layer, nullptr);
+         key_of.assign(n_slots, -1);
+         prev.resize(n_slots);
+         next.resize(n_slots);
++        seg.assign(n_slots, 0);
+         for (int32_t s = 0; s < n_slots; ++s) {
+             prev[s] = s - 1;
+             next[s] = s + 1 < n_slots ? s + 1 : -1;
+         }
+-        head = 0;
+-        tail = n_slots - 1;
++        head_[0] = 0; tail_[0] = n_slots - 1; cnt[0] = n_slots;
++        head_[1] = -1; tail_[1] = -1; cnt[1] = 0;
++        prot_cap = prot_frac > 0.0 ? (int32_t) (prot_frac*n_slots) : 0;
++        head = victim();
+         seen.assign(n_expert, 0);
+     }
+ 
+-    // move slot s to the tail (most recently used)
++    void unlink(int32_t s) {
++        const int g = seg[s];
++        if (prev[s] >= 0) { next[prev[s]] = next[s]; } else { head_[g] = next[s]; }
++        if (next[s] >= 0) { prev[next[s]] = prev[s]; } else { tail_[g] = prev[s]; }
++        cnt[g]--;
++    }
++
++    void push_tail(int g, int32_t s) {
++        seg[s] = (uint8_t) g;
++        prev[s] = tail_[g];
++        next[s] = -1;
++        if (tail_[g] >= 0) { next[tail_[g]] = s; } else { head_[g] = s; }
++        tail_[g] = s;
++        cnt[g]++;
++    }
++
++    int32_t victim() const {
++        return cnt[0] > 0 ? head_[0] : head_[1];
++    }
++
++    // a new expert in slot s (most recently used of segment 0)
+     void touch(int32_t s) {
+-        if (s == tail) {
++        if (!(seg[s] == 0 && s == tail_[0])) {
++            unlink(s);
++            push_tail(0, s);
++        }
++        head = victim();
++    }
++
++    // a hit on slot s
++    void hit(int32_t s) {
++        if (prot_cap == 0) {
++            touch(s);
+             return;
+         }
+-        if (prev[s] >= 0) {
+-            next[prev[s]] = next[s];
+-        } else {
+-            head = next[s];
++        unlink(s);
++        push_tail(1, s);
++        if (cnt[1] > prot_cap) {
++            const int32_t x = head_[1];
++            unlink(x);
++            push_tail(0, x);
+         }
+-        prev[next[s]] = prev[s];
+-
+-        prev[s] = tail;
+-        next[s] = -1;
+-        next[tail] = s;
+-        tail = s;
++        head = victim();
+     }
+ 
+     struct fill {
+@@ -110,7 +147,7 @@ struct moe_cache_lru {
+         // hits go to the tail first, so the head can be evicted below
+         for (int32_t e : uniq) {
+             if (slots[e] >= 0) {
+-                touch(slots[e]);
++                hit(slots[e]);
+                 n_hit++;
+             }
+         }
+@@ -560,7 +597,13 @@ struct llama_moe_cache::impl {
+                 g.n_slots = 0;
+                 continue;
+             }
+-            g.lru.init(model.layers.size(), n_expert, g.n_slots);
++            // (tq expert cache) LLAMA_MOE_SLRU=f (0 < f < 1, default 0 = plain LRU): segmented LRU with a protected share f of the slots
++            const char * slru = getenv("LLAMA_MOE_SLRU");
++            const double prot = slru ? std::min(std::max(atof(slru), 0.0), 0.95) : 0.0;
++            g.lru.init(model.layers.size(), n_expert, g.n_slots, prot);
++            if (prot > 0.0) {
++                LLAMA_LOG_INFO("%s: segmented LRU, %d of %d slots protected\n", __func__, g.lru.prot_cap, g.n_slots);
++            }
+             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
+             n_tensors_host  += g.layers.size();
+         }
+-- 
+2.54.0 (Apple Git-157)
+
